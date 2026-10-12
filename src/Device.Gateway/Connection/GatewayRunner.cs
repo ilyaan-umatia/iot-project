@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using Device.Gateway.Cloud;
 using Device.Gateway.Configuration;
 using Device.Gateway.Simulation;
 using Device.Gateway.Sparkplug;
@@ -7,7 +6,7 @@ using Google.Protobuf;
 
 namespace Device.Gateway.Connection;
 
-public sealed class GatewayRunner(MqttConnection connection, GatewaySettings settings, CloudForwarder forwarder)
+public sealed class GatewayRunner(MqttConnection connection, GatewaySettings settings)
 {
     private volatile bool _deviceOnline = true;
     public void SetDeviceOnline(bool online) => _deviceOnline = online;
@@ -34,11 +33,6 @@ public sealed class GatewayRunner(MqttConnection connection, GatewaySettings set
                 Console.WriteLine($"Connecting {mqtt.ClientId} to {mqtt.Host}:{mqtt.Port}...");
                 await connection.ConnectAsync(cancellationToken);
                 Console.WriteLine("Connected.");
-                using (var subscriptionTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
-                {
-                    subscriptionTimeout.CancelAfter(TimeSpan.FromSeconds(mqtt.ConnectTimeoutSeconds));
-                    await forwarder.WaitForSubscriptionAsync(subscriptionTimeout.Token);
-                }
                 await connection.PublishAsync(topic,
                     SparkplugPayloads.NodeBirth(connection.BirthDeathSequence, UptimeSeconds).ToByteArray(), cancellationToken);
                 Console.WriteLine($"Published NBIRTH: {topic}");

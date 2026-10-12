@@ -1,5 +1,5 @@
 using Application.Api.Services;
-using Device.Gateway.Cloud;
+using Cloud.Forwarder;
 using Device.Gateway.Sparkplug;
 using Google.Protobuf;
 using IoT.Contracts;
@@ -78,6 +78,20 @@ Reject(() => state.Process(new LifecycleEvent("node-device", "NDATA", "warehouse
     "fridge-01", prefix + "NDATA/gateway-01", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, 1, null, new())));
 Reject(() => state.Process(birth with { EventId = "wildcard", GroupId = "+", SourceTopic = "spBv1.0/+/DBIRTH/gateway-01/fridge-01" }));
 Console.WriteLine("PASS: GPIO door mapping, binary decoding, JSON roundtrip, lifecycle/recovery, duplicates, stale death, sequence gaps/wrap and validation.");
+
+var restartedDecoder = new SparkplugDecoder();
+Reject(() => restartedDecoder.Decode(prefix + "NDATA/gateway-01", SparkplugPayloads.NodeData(2, 5).ToByteArray()));
+var offlineWithoutBirth = restartedDecoder.Decode(prefix + "NDEATH/gateway-01", SparkplugPayloads.NodeDeath(9).ToByteArray());
+Check(offlineWithoutBirth is { MessageType: "NDEATH", BdSeq: 9 }, "Independent forwarder lost death without a local birth cache.");
+restartedDecoder.Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(10).ToByteArray());
+restartedDecoder.Decode(prefix + "DBIRTH/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(1, 5, 65, 17, 0).ToByteArray());
+restartedDecoder.Reset();
+Reject(() => restartedDecoder.Decode(prefix + "DDATA/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(2, 5, 65, 17, 0).ToByteArray()));
+restartedDecoder.Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(11).ToByteArray());
+restartedDecoder.Decode(prefix + "DBIRTH/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(1, 5, 65, 17, 0).ToByteArray());
+Check(restartedDecoder.Decode(prefix + "DDATA/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(2, 6, 65, 17, 0).ToByteArray()).Metrics["Temperature"].Number == 6,
+    "Fresh births did not restore decoding after reconnect.");
+Console.WriteLine("PASS: Independent forwarder cold start, death without birth cache and manual birth recovery after reset.");
 
 var testDirectory = Path.Combine(Path.GetTempPath(), "iot-sqlite-checks-" + Guid.NewGuid().ToString("N"));
 var databasePath = Path.Combine(testDirectory, "backend.db");

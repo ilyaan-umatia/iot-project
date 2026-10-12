@@ -5,12 +5,6 @@ public sealed class GatewaySettings
     public MqttSettings Mqtt { get; set; } = new();
     public SparkplugSettings Sparkplug { get; set; } = new();
     public DeviceSettings Device { get; set; } = new();
-    public IoTHubSettings IoTHub { get; set; } = new();
-}
-
-public sealed class IoTHubSettings
-{
-    public string DeviceConnectionString { get; set; } = "";
 }
 
 public sealed class MqttSettings
