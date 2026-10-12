@@ -1,5 +1,4 @@
 using Device.Gateway.Configuration;
-using Device.Gateway.Cloud;
 using Device.Gateway.Connection;
 using Microsoft.Extensions.Configuration;
 
@@ -16,10 +15,7 @@ try
     var settings = configuration.Get<GatewaySettings>()
         ?? throw new InvalidOperationException("Could not read appsettings.json.");
     using var connection = new MqttConnection(settings.Mqtt, settings.Sparkplug);
-    using var forwarder = new CloudForwarder(settings);
-    using var forwardingStop = new CancellationTokenSource();
-    var forwarding = forwarder.RunAsync(forwardingStop.Token);
-    var runner = new GatewayRunner(connection, settings, forwarder);
+    var runner = new GatewayRunner(connection, settings);
     var input = Task.Run(() =>
     {
         while (!stop.IsCancellationRequested)
@@ -34,10 +30,9 @@ try
     var running = runner.RunAsync(stop.Token);
     try
     {
-        if (await Task.WhenAny(input, running, forwarding) != running)
+        if (await Task.WhenAny(input, running) != running)
             stop.Cancel();
         await running;
-        if (forwarding.IsCompleted) await forwarding;
     }
     catch (OperationCanceledException) when (stop.IsCancellationRequested)
     {
@@ -46,24 +41,8 @@ try
     finally
     {
         stop.Cancel();
-        var connected = connection.IsConnected;
         using var disconnectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await connection.DisconnectAsync(disconnectTimeout.Token);
-        try
-        {
-            if (connected && !forwarding.IsCompleted)
-            {
-                using var flushTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                await forwarder.WaitForDeathAsync(connection.BirthDeathSequence, flushTimeout.Token);
-            }
-        }
-        catch (OperationCanceledException) { Console.WriteLine("Final NDEATH was not confirmed by Azure."); }
-        finally
-        {
-            forwardingStop.Cancel();
-            try { await forwarding; }
-            catch (OperationCanceledException) when (forwardingStop.IsCancellationRequested) { }
-        }
     }
     Console.WriteLine("Disconnected.");
 }

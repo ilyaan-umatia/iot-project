@@ -3,16 +3,17 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
-using Device.Gateway.Configuration;
+using Cloud.Forwarder.Configuration;
 using IoT.Contracts;
 using Microsoft.Azure.Devices.Client;
+using Microsoft.Extensions.Hosting;
 using MQTTnet;
 using MQTTnet.Formatter;
 using MQTTnet.Protocol;
 
-namespace Device.Gateway.Cloud;
+namespace Cloud.Forwarder;
 
-public sealed class CloudForwarder : IDisposable
+public sealed class CloudForwarder : BackgroundService
 {
     private readonly IMqttClient _mqtt = new MqttClientFactory().CreateMqttClient();
     private readonly MqttClientOptions _options;
@@ -21,12 +22,9 @@ public sealed class CloudForwarder : IDisposable
     private readonly string _filter;
     private readonly SparkplugDecoder _decoder = new();
     private readonly Channel<LifecycleEvent> _pending = Channel.CreateBounded<LifecycleEvent>(200);
-    private readonly object _gate = new();
-    private TaskCompletionSource _subscribed = NewSignal();
-    private int _forwardedDeath = -1;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    public CloudForwarder(GatewaySettings settings)
+    public CloudForwarder(ForwarderSettings settings)
     {
         var connectionString = settings.IoTHub.DeviceConnectionString;
         if (!string.IsNullOrWhiteSpace(connectionString))
@@ -55,18 +53,11 @@ public sealed class CloudForwarder : IDisposable
         }
         _options = builder.Build();
         _filter = $"spBv1.0/{settings.Sparkplug.GroupId}/+/{settings.Sparkplug.EdgeNodeId}/#";
-        _mqtt.DisconnectedAsync += _ =>
-        {
-            lock (_gate)
-                if (_subscribed.Task.IsCompleted) _subscribed = NewSignal();
-            return Task.CompletedTask;
-        };
         _mqtt.ApplicationMessageReceivedAsync += args =>
         {
             try
             {
                 var item = _decoder.Decode(args.ApplicationMessage.Topic, args.ApplicationMessage.Payload.ToArray());
-                if (item.MessageType == "NBIRTH") Volatile.Write(ref _forwardedDeath, -1);
                 if (!_pending.Writer.TryWrite(item))
                     Console.WriteLine($"Cloud buffer full. Dropped {item.MessageType}: {item.EventId}");
             }
@@ -78,24 +69,7 @@ public sealed class CloudForwarder : IDisposable
         };
     }
 
-    private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    public async Task WaitForSubscriptionAsync(CancellationToken cancellationToken)
-    {
-        while (true)
-        {
-            Task ready;
-            lock (_gate)
-            {
-                if (_mqtt.IsConnected && _subscribed.Task.IsCompletedSuccessfully) return;
-                if (_subscribed.Task.IsCompleted) _subscribed = NewSignal();
-                ready = _subscribed.Task;
-            }
-            await ready.WaitAsync(cancellationToken);
-        }
-    }
-
-    public async Task RunAsync(CancellationToken cancellationToken)
+    protected override async Task ExecuteAsync(CancellationToken cancellationToken)
     {
         using var session = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var forwarding = ForwardAsync(session.Token);
@@ -113,8 +87,6 @@ public sealed class CloudForwarder : IDisposable
                         await _mqtt.ConnectAsync(_options, cancellationToken);
                         await _mqtt.SubscribeAsync(factory.CreateSubscribeOptionsBuilder()
                             .WithTopicFilter(_filter, MqttQualityOfServiceLevel.AtLeastOnce).Build(), cancellationToken);
-                        lock (_gate)
-                            if (_mqtt.IsConnected) _subscribed.TrySetResult();
                         Console.WriteLine($"Cloud forwarder subscribed: {_filter}");
                     }
                     await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
@@ -123,7 +95,7 @@ public sealed class CloudForwarder : IDisposable
                 catch (Exception error)
                 {
                     Console.WriteLine($"Forwarder broker connection failed ({error.GetType().Name}). Retry in 2s.");
-                    // A failed subscription must reconnect and subscribe before announcing readiness.
+                    // Retry the subscription on a fresh connection.
                     if (_mqtt.IsConnected)
                         await _mqtt.DisconnectAsync(new MqttClientDisconnectOptionsBuilder().Build(), cancellationToken);
                     await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
@@ -159,8 +131,8 @@ public sealed class CloudForwarder : IDisposable
                         ContentType = "application/json", ContentEncoding = "utf-8", MessageId = item.EventId
                     };
                     await _azure.SendEventAsync(message, cancellationToken).WaitAsync(cancellationToken);
-                    Console.WriteLine($"Forwarded {item.MessageType}: {item.EventId}");
-                    if (item.MessageType == "NDEATH") Volatile.Write(ref _forwardedDeath, (int)item.BdSeq!.Value);
+                    var session = item.MessageType == "NDEATH" ? $" (bdSeq {item.BdSeq})" : "";
+                    Console.WriteLine($"Forwarded {item.MessageType}: {item.EventId}{session}");
                     break;
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
@@ -173,16 +145,9 @@ public sealed class CloudForwarder : IDisposable
         }
     }
 
-    public async Task WaitForDeathAsync(ulong bdSeq, CancellationToken cancellationToken)
+    public override void Dispose()
     {
-        if (_azure is null) return;
-        // This also waits for earlier events, which are forwarded by the same queue reader.
-        while (Volatile.Read(ref _forwardedDeath) != (int)bdSeq)
-            await Task.Delay(100, cancellationToken);
-    }
-
-    public void Dispose()
-    {
+        base.Dispose();
         _mqtt.Dispose();
         _azure?.Dispose();
         _certificate?.Dispose();

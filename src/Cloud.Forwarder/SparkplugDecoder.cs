@@ -1,7 +1,7 @@
 using IoT.Contracts;
 using Org.Eclipse.Tahu.Protobuf;
 
-namespace Device.Gateway.Cloud;
+namespace Cloud.Forwarder;
 
 public sealed class SparkplugDecoder
 {
