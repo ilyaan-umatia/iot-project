@@ -7,7 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Device.Gateway/Device.Gateway.csproj" />
-    <ProjectReference Include="../../src/Cloud.Forwarder/Cloud.Forwarder.csproj" />
     <ProjectReference Include="../../src/Application.Api/Application.Api.csproj" />
   </ItemGroup>
 </Project>

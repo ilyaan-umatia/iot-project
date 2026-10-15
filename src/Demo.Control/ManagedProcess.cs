@@ -1,0 +1,108 @@
+using System.Diagnostics;
+
+namespace Demo.Control;
+
+// One demo component run as a child process, with its console output kept for the page and a log file.
+public sealed class ManagedProcess(string name, string workspace, string logDirectory, string? instance = null)
+{
+    // Several components can run the same project, e.g. one simulator per fridge.
+    private readonly string _label = instance ?? name;
+    private readonly object _gate = new();
+    private readonly LinkedList<string> _lines = new();
+    private Process? _process;
+    private StreamWriter? _log;
+
+    public event Action<string>? Line;
+    public bool Running
+    {
+        get { lock (_gate) return _process is { HasExited: false }; }
+    }
+
+    public void Start(IEnumerable<string> arguments)
+    {
+        lock (_gate)
+        {
+            if (_process is { HasExited: false }) return;
+            var start = new ProcessStartInfo("dotnet")
+            {
+                WorkingDirectory = workspace,
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            start.ArgumentList.Add(Path.Combine(workspace, "src", name, "bin", "Debug", "net8.0", name + ".dll"));
+            foreach (var argument in arguments) start.ArgumentList.Add(argument);
+            Directory.CreateDirectory(logDirectory);
+            _log?.Dispose();
+            _log = new StreamWriter(Path.Combine(logDirectory, _label + ".log"), append: true) { AutoFlush = true };
+            var process = new Process { StartInfo = start, EnableRaisingEvents = true };
+            process.OutputDataReceived += (_, e) => { if (e.Data is not null) Append(e.Data); };
+            process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Append("ERR " + e.Data); };
+            process.Exited += (_, _) => Append($"[demo] {_label} exited.");
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            _process = process;
+            Append($"[demo] {_label} started.");
+        }
+    }
+
+    // Kill without warning, as a crash or power loss would.
+    public void Crash()
+    {
+        Process? process;
+        lock (_gate) process = _process;
+        if (process is { HasExited: false })
+        {
+            Append($"[demo] {_label} crashed (killed).");
+            process.Kill(entireProcessTree: true);
+            process.WaitForExit(5000);
+        }
+    }
+
+    // Ask the component to shut down cleanly; kill it if it does not exit in time.
+    public async Task StopAsync(bool acceptsStopCommand)
+    {
+        Process? process;
+        lock (_gate) process = _process;
+        if (process is not { HasExited: false }) return;
+        if (!acceptsStopCommand) { Crash(); return; }
+        Send("stop");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try { await process.WaitForExitAsync(timeout.Token); }
+        catch (OperationCanceledException) { Crash(); }
+    }
+
+    public void Send(string command)
+    {
+        lock (_gate)
+        {
+            if (_process is not { HasExited: false }) return;
+            try
+            {
+                _process.StandardInput.WriteLine(command);
+                _process.StandardInput.Flush();
+            }
+            catch (IOException) { }
+        }
+    }
+
+    public string[] Tail(int count)
+    {
+        lock (_lines) return _lines.Skip(Math.Max(0, _lines.Count - count)).ToArray();
+    }
+
+    private void Append(string line)
+    {
+        var stamped = $"{DateTime.Now:HH:mm:ss} {line}";
+        lock (_lines)
+        {
+            _lines.AddLast(stamped);
+            while (_lines.Count > 400) _lines.RemoveFirst();
+        }
+        try { _log?.WriteLine(stamped); } catch (ObjectDisposedException) { }
+        Line?.Invoke(line);
+    }
+}

@@ -16,6 +16,11 @@ public sealed class ConnectionStateMachine
     private readonly object _sync = new();
     private ConnectionState _current = ConnectionState.Disconnected;
 
+    public ConnectionState Current
+    {
+        get { lock (_sync) return _current; }
+    }
+
     public bool TryMoveTo(ConnectionState next)
     {
         lock (_sync)

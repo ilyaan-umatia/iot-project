@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography.X509Certificates;
 using Device.Gateway.Configuration;
 using Device.Gateway.Sparkplug;
@@ -19,6 +20,8 @@ public sealed class MqttConnection : IDisposable
     private readonly string _deathTopic;
     public ulong BirthDeathSequence { get; private set; }
     public bool IsConnected => _client.IsConnected;
+    public ConnectionState State => _state.Current;
+    public event Func<string, byte[], Task>? MessageReceived;
     private readonly X509Certificate2? _trustedCertificate;
 
     public MqttConnection(MqttSettings settings, SparkplugSettings sparkplug)
@@ -55,6 +58,9 @@ public sealed class MqttConnection : IDisposable
             _disconnected.TrySetResult();
             return Task.CompletedTask;
         };
+        _client.ApplicationMessageReceivedAsync += args =>
+            MessageReceived?.Invoke(args.ApplicationMessage.Topic, args.ApplicationMessage.Payload.ToArray())
+            ?? Task.CompletedTask;
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken)
@@ -92,13 +98,28 @@ public sealed class MqttConnection : IDisposable
 
     public async Task PrepareRetryAsync(CancellationToken cancellationToken)
     {
-        if (_client.IsConnected)
-            await PublishDeathAndDisconnectAsync(cancellationToken);
+        try
+        {
+            if (_client.IsConnected)
+                await PublishDeathAndDisconnectAsync(cancellationToken);
+        }
+        catch (Exception error) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The connection dropped meanwhile; the broker publishes the Will instead.
+            Console.WriteLine($"NDEATH not sent ({error.GetType().Name}).");
+        }
         _state.TryMoveTo(ConnectionState.Disconnected);
         if (!_state.TryMoveTo(ConnectionState.RetryWaiting))
             throw new InvalidOperationException("Gateway cannot retry in its current state.");
     }
 
+
+    public async Task SubscribeAsync(IEnumerable<string> topics, CancellationToken cancellationToken)
+    {
+        var builder = new MqttClientFactory().CreateSubscribeOptionsBuilder();
+        foreach (var topic in topics) builder.WithTopicFilter(topic, MqttQualityOfServiceLevel.AtLeastOnce);
+        await _client.SubscribeAsync(builder.Build(), cancellationToken);
+    }
 
     public bool MarkOnline() => _state.TryMoveTo(ConnectionState.Online);
 

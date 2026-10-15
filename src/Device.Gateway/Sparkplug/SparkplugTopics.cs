@@ -7,6 +7,13 @@ public static class SparkplugTopics
     public static string NodeBirth(SparkplugSettings settings) => NodeTopic(settings, "NBIRTH");
     public static string NodeData(SparkplugSettings settings) => NodeTopic(settings, "NDATA");
     public static string NodeDeath(SparkplugSettings settings) => NodeTopic(settings, "NDEATH");
+    public static string NodeCommand(SparkplugSettings settings) => NodeTopic(settings, "NCMD");
+
+    public static string PrimaryHostState(string hostId)
+    {
+        ValidateIdentifier(hostId, nameof(hostId));
+        return $"spBv1.0/STATE/{hostId}";
+    }
 
     private static string NodeTopic(SparkplugSettings settings, string messageType)
     {

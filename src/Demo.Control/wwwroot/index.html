@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IoT Demo Console</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --line: #e2e5ea; --text: #1b1f24; --muted: #66707c;
+    --ok: #1f9d55; --ok-soft: #e3f5ea; --bad: #d1453b; --bad-soft: #fbe7e5;
+    --warn: #c27c0e; --warn-soft: #fbf0dc; --idle: #9aa3ad; --idle-soft: #eef0f2;
+    --accent: #2f6fde; --accent-soft: #e5edfb; --violet: #7a4fd6; --violet-soft: #efe9fb;
+    --c1: #2f6fde; --c2: #8a4fd6; --c3: #0f8f8a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --panel: #171b21; --line: #262c34; --text: #e7eaee; --muted: #8b95a1;
+      --ok: #3ccf7a; --ok-soft: #12291c; --bad: #f2675d; --bad-soft: #321716;
+      --warn: #f0a93b; --warn-soft: #30230e; --idle: #6b7480; --idle-soft: #1d2229;
+      --accent: #6b9bff; --accent-soft: #16223a; --violet: #a585ff; --violet-soft: #221a36;
+      --c1: #6b9bff; --c2: #b28cff; --c3: #3cc8c0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1360px; margin: 0 auto; padding: 18px 16px 40px; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  .sub { color: var(--muted); }
+  .spacer { flex: 1; }
+  button { font: inherit; cursor: pointer; }
+  .btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 8px;
+    padding: 5px 11px; font-size: 13px; font-weight: 550; }
+  .btn:hover:not(:disabled) { border-color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.danger { color: var(--bad); }
+  .btn.on { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+  .btn.sm { padding: 2px 8px; font-size: 12px; border-radius: 6px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; background: var(--idle-soft); color: var(--muted); }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); }
+  .pill.bad { background: var(--bad-soft); color: var(--bad); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; display: inline-block; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+    margin: 0 0 12px; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+  .panel h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: auto; }
+  .toast { position: fixed; right: 16px; bottom: 16px; max-width: 360px; padding: 10px 14px; border-radius: 10px;
+    background: var(--text); color: var(--bg); font-weight: 550; opacity: 0; transform: translateY(8px);
+    transition: .2s; pointer-events: none; z-index: 10; }
+  .toast.show { opacity: 1; transform: none; }
+  .toast.error { background: var(--bad); color: #fff; }
+
+  /* Pipeline: three fridges, each with its own link into the edge broker */
+  .pipeline { display: grid; align-items: center;
+    grid-template-columns: minmax(0,1.5fr) minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr); }
+  .fridges { display: grid; gap: 6px; }
+  .frow { display: grid; grid-template-columns: minmax(0, 1fr) 64px; align-items: center; }
+  .node { border: 1.5px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel);
+    display: flex; flex-direction: column; gap: 3px; transition: border-color .3s, background .3s; min-width: 0; align-self: stretch; }
+  .node.mini { padding: 6px 10px; gap: 1px; }
+  .node.mini .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .node.mini .actions { margin: 0 0 0 auto; padding: 0; }
+  .node .name { font-weight: 650; display: flex; align-items: center; gap: 6px; }
+  .node .role { font-size: 12px; color: var(--muted); }
+  .node .detail { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .node:not(.mini) .detail { min-height: 34px; }
+  .node .actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; }
+  .node.ok { border-color: var(--ok); } .node.ok .name .dot { color: var(--ok); }
+  .node.warn { border-color: var(--warn); background: var(--warn-soft); } .node.warn .name .dot { color: var(--warn); }
+  .node.bad { border-color: var(--bad); background: var(--bad-soft); } .node.bad .name .dot { color: var(--bad); }
+  .node.idle .name .dot { color: var(--idle); }
+  .linkwrap { display: flex; flex-direction: column; justify-content: center; padding: 0 4px; min-width: 64px; }
+  .linkwrap small { text-align: center; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  .link { height: 2px; background: var(--line); position: relative; overflow: hidden; }
+  .link.flow::after { content: ""; position: absolute; top: -2px; left: -12px; width: 12px; height: 6px;
+    border-radius: 3px; background: var(--dotc, var(--accent)); animation: travel .9s linear; }
+  .link.cut { background: repeating-linear-gradient(90deg, var(--bad) 0 6px, transparent 6px 10px); }
+  @keyframes travel { to { left: 100%; } }
+  .edge-col { align-self: stretch; display: flex; }
+  .edge-col .node { flex: 1; }
+
+  .row2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1.3fr) minmax(0,1.2fr); gap: 14px; margin-top: 14px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .big { font-size: 40px; font-weight: 750; line-height: 1; font-variant-numeric: tabular-nums; }
+  .big.warn { color: var(--warn); } .big.ok { color: var(--ok); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .ctable { display: grid; grid-template-columns: auto auto 1fr 1fr 1fr; gap: 8px 8px; align-items: center; font-size: 13px; }
+  .ctable .h { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .ctable .who { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  .ctable .num { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .ctable .btn { width: 100%; }
+
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 260px; overflow-y: auto; }
+  .steps li { display: grid; grid-template-columns: 18px 1fr; gap: 8px; font-size: 13px; }
+  .steps li small { display: block; color: var(--muted); font-size: 12px; }
+  .steps .icon { font-weight: 700; text-align: center; color: var(--idle); }
+  .steps .running .icon { color: var(--accent); } .steps .done .icon { color: var(--ok); } .steps .failed .icon { color: var(--bad); }
+  .steps .running { font-weight: 600; }
+  .result { margin-top: 10px; padding: 8px 10px; border-radius: 8px; font-weight: 600; font-size: 13px; }
+  .result.pass { background: var(--ok-soft); color: var(--ok); } .result.fail { background: var(--bad-soft); color: var(--bad); }
+  .result div { font-weight: 450; margin-top: 2px; }
+
+  .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
+  .stat .value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .stat .label { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .stat.good .value { color: var(--ok); } .stat.bad .value { color: var(--bad); }
+  .stat.flash, .row.new { animation: flash 1.2s ease-out; }
+  @keyframes flash { from { background: var(--warn-soft); } }
+  .stale { opacity: .55; }
+
+  .devices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .dcard { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; border-top: 3px solid var(--dc); }
+  .dcard .top { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+  .dcard .id { font-weight: 650; font-size: 13px; }
+  .dcard .temp { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .dcard .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
+  .tag { font-size: 11px; font-weight: 650; padding: 2px 7px; border-radius: 999px; background: var(--idle-soft); color: var(--muted); }
+  .tag.ok { background: var(--ok-soft); color: var(--ok); } .tag.bad { background: var(--bad-soft); color: var(--bad); }
+  .tag.warn { background: var(--warn-soft); color: var(--warn); }
+  .empty { color: var(--muted); padding: 10px 0; }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 14px; }
+  .stack { display: grid; gap: 14px; align-content: start; }
+  svg { width: 100%; height: auto; display: block; }
+  .axis { stroke: var(--line); } .axis-label { fill: var(--muted); font-size: 11px; }
+  .threshold { stroke: var(--bad); stroke-dasharray: 4 4; opacity: .7; }
+  .series { fill: none; stroke-width: 2; }
+  .hist { fill: none; stroke: var(--warn); stroke-width: 2; }
+  .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+  .legend i { display: inline-block; width: 12px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: 3px; }
+  .legend i.ring { width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--warn); vertical-align: -1px; }
+
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+  .tab { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 999px; padding: 3px 11px; font-size: 12px; }
+  .tab.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .tabnote { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .feed { max-height: 640px; overflow-y: auto; }
+  .row { display: grid; grid-template-columns: 62px 70px minmax(0, 1fr); gap: 8px; align-items: center;
+    padding: 5px 2px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .row time { color: var(--muted); font-size: 12px; }
+  .row .text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .row .tag { margin-right: 4px; }
+  .badge { font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 6px; text-align: center; background: var(--idle-soft); color: var(--muted); }
+  .b-NBIRTH, .b-DBIRTH, .b-online { background: var(--ok-soft); color: var(--ok); }
+  .b-NDEATH, .b-DDEATH, .b-offline { background: var(--bad-soft); color: var(--bad); }
+  .b-DDATA, .b-reading { background: var(--accent-soft); color: var(--accent); }
+  .b-NDATA, .b-STATE, .b-NCMD { background: var(--violet-soft); color: var(--violet); }
+  .logs { font: 12px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-word; margin: 0; }
+  select { font: inherit; font-size: 12px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+  .flows { display: grid; gap: 6px; font-size: 13px; }
+  .flows div { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 8px; align-items: start; }
+
+  @media (max-width: 1150px) {
+    .pipeline { grid-template-columns: minmax(0, 1fr); }
+    .frow { grid-template-columns: minmax(0, 1fr); }
+    .frow .linkwrap { display: none; }
+    .linkwrap { flex-direction: row; align-items: center; justify-content: center; padding: 4px 0; min-width: 0; }
+    .linkwrap small { margin: 0 8px 0 0; }
+    .link { width: 2px; height: 22px; }
+    .link.flow::after { left: -2px; top: -12px; width: 6px; height: 12px; animation: down .9s linear; }
+    @keyframes down { to { top: 100%; } }
+    .fridges { margin-bottom: 10px; }
+    .row2, .grid { grid-template-columns: minmax(0, 1fr); }
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .devices { grid-template-columns: minmax(0, 1fr); }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>IoT Demo Console</h1>
+    <span class="sub">Sparkplug B edge pipeline · three fridges, one gateway</span>
+    <span class="spacer"></span>
+    <span class="pill" id="backend-pill"><span class="dot"></span><span>Connecting</span></span>
+    <button class="btn primary" data-demo="start-all">Start all</button>
+    <button class="btn" data-demo="stop-all">Stop all</button>
+    <button class="btn danger" data-demo="reset" title="Wipes broker data and demo state, then starts everything">Reset demo</button>
+  </header>
+
+  <section class="panel">
+    <h2>Data path <span class="note sub">Stop = clean shutdown · Crash = kill without warning · each fridge has its own MQTT connection</span></h2>
+    <div class="pipeline" id="pipeline"></div>
+  </section>
+
+  <section class="row2">
+    <div class="panel">
+      <h2>Gateway buffer (SQLite outbox)</h2>
+      <div class="big" id="g-unsent">—</div>
+      <div class="hint">messages saved on disk, waiting for the broker's acknowledgement</div>
+      <dl class="kv" style="margin-top:12px" id="g-kv"></dl>
+    </div>
+    <div class="panel">
+      <h2>Fridges (physical world)</h2>
+      <div class="ctable" id="controls"></div>
+      <div class="hint">Door: GPIO input, temperature rises while open · Fault: temperature climbs past the 8 °C alarm · Pause: sensor stays connected but silent</div>
+    </div>
+    <div class="panel">
+      <h2>Resilience test <button class="btn sm primary" id="run-test" style="margin-left:auto">Run</button></h2>
+      <ul class="steps" id="steps"><li><span></span><span class="sub">Crashes and restarts each component in turn (about 2½ minutes), then checks every fridge's readings arrived exactly once.</span></li></ul>
+      <div id="result"></div>
+    </div>
+  </section>
+
+  <section class="stats" id="stats">
+    <div class="panel stat" id="s-readings"><div class="value">—</div><div class="label">Readings stored (all fridges)</div></div>
+    <div class="panel stat" id="s-missing"><div class="value">—</div><div class="label">Missing readings</div></div>
+    <div class="panel stat" id="s-duplicates"><div class="value">—</div><div class="label">Duplicate readings</div></div>
+    <div class="panel stat" id="s-historical"><div class="value">—</div><div class="label">Replayed as historical</div></div>
+    <div class="panel stat" id="s-session"><div class="value">—</div><div class="label">Gateway session (bdSeq)</div></div>
+  </section>
+
+  <section class="grid">
+    <div class="stack">
+      <div class="panel" id="device-panel">
+        <h2>Devices (as the backend sees them)</h2>
+        <div class="devices" id="devices"><div class="empty">No device has been born yet.</div></div>
+      </div>
+      <div class="panel" id="chart-panel">
+        <h2>Temperature by measurement time</h2>
+        <svg id="chart" viewBox="0 0 640 240" role="img" aria-label="Temperature readings per fridge"></svg>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div class="panel">
+        <h2>Sparkplug message types</h2>
+        <div class="flows">
+          <div><b class="badge b-STATE">STATE</b><span>Backend (Primary Host) online/offline. Retained, with a Will. The gateway only publishes while it is online.</span></div>
+          <div><b class="badge b-NBIRTH">NBIRTH</b><span>Gateway session start: seq 0, bdSeq, Node Control/Rebirth.</span></div>
+          <div><b class="badge b-DBIRTH">DBIRTH</b><span>A device introduced with all its metrics; one per fridge.</span></div>
+          <div><b class="badge b-DDATA">DDATA</b><span>A reading. seq 0–255 (shared across the gateway) detects gaps; DeviceSeq removes duplicates.</span></div>
+          <div><b class="badge b-NDATA">NDATA</b><span>Gateway heartbeat (uptime).</span></div>
+          <div><b class="badge b-DDEATH">DDEATH</b><span>One device lost: its MQTT Will on the edge broker fired. The others are unaffected.</span></div>
+          <div><b class="badge b-NDEATH">NDEATH</b><span>Gateway session ended, which takes all its devices offline with it.</span></div>
+          <div><b class="badge b-NCMD">NCMD</b><span>Backend asks for a Rebirth when it is out of sync.</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="tabs" id="tabs">
+        <button class="tab on" data-tab="stored">Stored by backend</button>
+        <button class="tab" data-tab="upstream">On the wire: Mosquitto</button>
+        <button class="tab" data-tab="edge">On the wire: edge broker</button>
+        <button class="tab" data-tab="logs">Logs</button>
+      </div>
+      <div class="tabnote" id="tabnote"></div>
+      <div id="feed" class="feed"></div>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const time = iso => iso ? new Date(iso).toLocaleTimeString([], { hour12: false }) : "—";
+const num = (m, k) => m?.[k]?.number;
+const CORE = {
+  "edge-broker": { label: "Edge broker", role: "Mosquitto :1883 · one session per device" },
+  "gateway": { label: "Gateway", role: "SQLite outbox · Sparkplug edge node" },
+  "mosquitto": { label: "Mosquitto", role: "Broker :8883 · TLS" },
+  "backend": { label: "Backend", role: "Primary Host · SQLite" }
+};
+const TAB_NOTES = {
+  stored: "Messages the backend received and saved, newest first. This is what reaches the application.",
+  upstream: "Every Sparkplug message passing through Mosquitto, decoded live, including STATE and NCMD.",
+  edge: "Raw device traffic on the edge broker, before the gateway turns it into Sparkplug.",
+  logs: "Console output of the selected component."
+};
+let fridgeIds = [], tab = "stored", logName = "gateway", state = null, backend = null;
+let lastEventId = 0, lastWireId = 0, lastHistorical = null, busy = false;
+const color = id => `var(--c${fridgeIds.indexOf(id) % 3 + 1})`;
+
+function toast(message, error) {
+  const t = $("toast");
+  t.textContent = message;
+  t.className = "toast show" + (error ? " error" : "");
+  clearTimeout(t.timer);
+  t.timer = setTimeout(() => t.className = "toast", 3500);
+}
+
+async function post(path, label) {
+  if (busy) return;
+  busy = true;
+  document.querySelectorAll("button[data-act],button[data-demo],button[data-cmd]").forEach(b => b.disabled = true);
+  toast(label + "…");
+  try {
+    const response = await fetch(path, { method: "POST" });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.message || response.statusText);
+    toast(body.message || label + " done.");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    busy = false;
+    document.querySelectorAll("button[data-act],button[data-demo],button[data-cmd]").forEach(b => b.disabled = false);
+    refresh();
+  }
+}
+
+async function getJson(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) throw new Error(path + " " + response.status);
+  return response.json();
+}
+
+// Pipeline
+function buildPipeline() {
+  const core = (name, link) => `
+    ${link ? `<div class="linkwrap"><small>${link}</small><div class="link" id="l-${name}"></div></div>` : ""}
+    <div class="node idle" id="n-${name}">
+      <div class="name"><span class="dot"></span>${CORE[name].label}</div>
+      <div class="role">${CORE[name].role}</div>
+      <div class="detail" id="d-${name}">—</div>
+      <div class="actions" id="a-${name}"></div>
+    </div>`;
+  $("pipeline").innerHTML = `
+    <div class="fridges">${fridgeIds.map(id => `
+      <div class="frow">
+        <div class="node mini idle" id="n-${id}">
+          <div class="head"><span class="name"><span class="dot"></span><span class="swatch" style="background:${color(id)}"></span>${id}</span>
+            <span class="actions" id="a-${id}"></span></div>
+          <div class="detail" id="d-${id}">—</div>
+        </div>
+        <div class="linkwrap"><small>MQTT</small><div class="link" id="l-${id}" style="--dotc:${color(id)}"></div></div>
+      </div>`).join("")}
+    </div>
+    <div class="edge-col">${core("edge-broker")}</div>
+    ${core("gateway", "ack after save")}
+    ${core("mosquitto", "Sparkplug B")}
+    ${core("backend", "persistent session")}`;
+}
+
+function fridgeView(id) { return state.fridges.find(f => f.id === id); }
+
+function nodeState(c, gw) {
+  if (!c.running) return "bad";
+  if (c.name === "gateway" && gw && (gw.upstream !== "Online" || !gw.hostOnline)) return "warn";
+  if (c.name === "backend" && !state.backendReachable) return "warn";
+  if (fridgeIds.includes(c.name) && fridgeView(c.name)?.controls.paused) return "warn";
+  return "ok";
+}
+
+function nodeDetail(c, gw) {
+  if (!c.running) return c.kind === "container" ? `container ${c.status}` : "stopped";
+  if (fridgeIds.includes(c.name)) {
+    const f = fridgeView(c.name);
+    return `${f.controls.paused ? "paused" : "sending"} · last #${f.lastSent || "—"} · GPIO ${f.gpioPin}${f.controls.doorOpen ? " · door open" : ""}${f.controls.spike ? " · fault" : ""}`;
+  }
+  switch (c.name) {
+    case "gateway":
+      if (!gw) return "starting…";
+      return `${gw.upstream === "Online" ? "publishing" : gw.hostOnline ? gw.upstream : "waiting for host STATE"} · ${gw.unsent} buffered`;
+    case "backend": return state.backendReachable ? "storing · STATE online" : "starting…";
+    case "mosquitto": return state.monitors.upstream ? "running · persistence on" : "running · connecting";
+    default: return state.monitors.edge ? `running · ${state.fridges.filter(f => f.running).length} device sessions` : "running · connecting";
+  }
+}
+
+function renderPipeline() {
+  const gw = state.gateway;
+  const up = Object.fromEntries(state.components.map(c => [c.name, c.running]));
+  for (const c of state.components) {
+    const node = $("n-" + c.name);
+    if (!node) continue;
+    node.className = "node" + (fridgeIds.includes(c.name) ? " mini " : " ") + nodeState(c, gw);
+    $("d-" + c.name).textContent = nodeDetail(c, gw);
+    const actions = $("a-" + c.name), key = c.actions.join(",");
+    if (actions.dataset.key !== key) {
+      actions.dataset.key = key;
+      actions.innerHTML = c.actions.map(a => `<button class="btn sm${a === "crash" ? " danger" : ""}" data-act="${c.name}/${a}">${a[0].toUpperCase() + a.slice(1)}</button>`).join("");
+    }
+  }
+  for (const id of fridgeIds) $("l-" + id).classList.toggle("cut", !(up[id] && up["edge-broker"]));
+  $("l-gateway").classList.toggle("cut", !(up["edge-broker"] && up.gateway));
+  $("l-mosquitto").classList.toggle("cut", !(up.gateway && up.mosquitto));
+  $("l-backend").classList.toggle("cut", !(up.mosquitto && up.backend));
+}
+
+function pulse(...ids) {
+  for (const id of ids) {
+    const link = $("l-" + id);
+    if (!link || link.classList.contains("cut")) continue;
+    link.classList.remove("flow"); void link.offsetWidth; link.classList.add("flow");
+  }
+}
+
+// Gateway, fridges, scenario
+function renderGateway() {
+  const gw = state.gateway;
+  const big = $("g-unsent");
+  big.textContent = gw ? gw.unsent : "—";
+  big.className = "big" + (gw ? (gw.unsent > 0 ? " warn" : " ok") : "");
+  $("g-kv").innerHTML = gw ? `
+    <dt>Upstream</dt><dd>${esc(gw.upstream)}</dd>
+    <dt>Host STATE</dt><dd>${gw.hostOnline ? "online" : "offline: buffering"}</dd>
+    <dt>Edge intake</dt><dd>${gw.intakeConnected ? "subscribed" : "disconnected"}</dd>
+    <dt>Session</dt><dd>bdSeq ${esc(gw.bdSeq)}</dd>
+    <dt>Last sent</dt><dd>${esc(gw.lastPublished ?? "—")}</dd>` : `<dt>Status</dt><dd>gateway not running</dd>`;
+}
+
+function renderControls() {
+  const cell = (f, on, cmdOn, cmdOff, textOn, textOff) =>
+    `<button class="btn sm${on ? " on" : ""}" data-cmd="${f.id}/${on ? cmdOff : cmdOn}"${f.running && !busy ? "" : " disabled"}>${on ? textOn : textOff}</button>`;
+  $("controls").innerHTML = `<span class="h">Fridge</span><span class="h">Last</span><span class="h">Door</span><span class="h">Cooling</span><span class="h">Readings</span>` +
+    state.fridges.map(f => `
+      <span class="who"><span class="swatch" style="background:${color(f.id)}"></span>${esc(f.id)}</span>
+      <span class="num">#${f.lastSent || "—"}</span>
+      ${cell(f, f.controls.doorOpen, "door-open", "door-close", "Close door", "Open door")}
+      ${cell(f, f.controls.spike, "spike-on", "spike-off", "Fix cooling", "Start fault")}
+      ${cell(f, f.controls.paused, "pause", "resume", "Resume", "Pause")}`).join("");
+}
+
+function renderScenario() {
+  const s = state.scenario;
+  $("run-test").disabled = s.running || busy;
+  $("run-test").textContent = s.running ? "Running…" : "Run";
+  if (s.steps.length) {
+    const icons = { pending: "○", running: "▶", done: "✓", failed: "✕" };
+    $("steps").innerHTML = s.steps.map(step => `<li class="${step.status}"><span class="icon">${icons[step.status]}</span><span>${esc(step.label)}<small>${esc(step.explanation)}</small></span></li>`).join("");
+    $("steps").querySelector(".running")?.scrollIntoView({ block: "nearest" });
+  }
+  $("result").innerHTML = s.result ? `<div class="result ${s.passed ? "pass" : "fail"}">${s.passed ? "PASS" : "FAIL"}${s.result.split(" · ").map(line => `<div>${esc(line)}</div>`).join("")}</div>` : "";
+}
+
+// Backend views
+function setStat(id, value, tone) {
+  const el = $(id);
+  el.querySelector(".value").textContent = value;
+  el.classList.toggle("good", tone === "good");
+  el.classList.toggle("bad", tone === "bad");
+}
+
+function renderBackend() {
+  const stale = !state.backendReachable;
+  ["stats", "device-panel", "chart-panel"].forEach(id => $(id).classList.toggle("stale", stale));
+  $("backend-pill").className = "pill " + (state.backendReachable ? "ok" : "bad");
+  $("backend-pill").lastElementChild.textContent = state.backendReachable ? "Backend live" : "Backend down: showing last known data";
+  if (!backend) return;
+  const { gateways, devices, summaries, histories } = backend;
+  const gateway = gateways[0];
+  const sum = key => summaries.reduce((total, s) => total + (s[key] ?? 0), 0);
+  setStat("s-readings", sum("readings"));
+  setStat("s-missing", sum("missing"), sum("missing") ? "bad" : "good");
+  setStat("s-duplicates", sum("duplicates"), sum("duplicates") ? "bad" : "good");
+  const historical = sum("historical");
+  setStat("s-historical", historical);
+  if (lastHistorical !== null && historical > lastHistorical) { const t = $("s-historical"); t.classList.remove("flash"); void t.offsetWidth; t.classList.add("flash"); }
+  lastHistorical = historical;
+  setStat("s-session", gateway ? `${gateway.bdSeq}${gateway.online ? "" : " (offline)"}` : "—");
+
+  $("devices").innerHTML = fridgeIds.map(id => {
+    const d = devices.find(x => x.deviceId === id), s = summaries.find(x => x.deviceId === id);
+    if (!d) return `<div class="dcard" style="--dc:${color(id)}"><div class="id">${esc(id)}</div><div class="empty">not born yet</div></div>`;
+    return `<div class="dcard" style="--dc:${color(id)}">
+      <div class="top"><span class="id">${esc(id)}</span><span class="meta">GPIO ${esc(d.gpioPin)}</span></div>
+      <div class="temp">${d.temperature.toFixed(1)} °C</div>
+      <div class="meta">${d.humidity.toFixed(0)}% · door ${d.doorOpen ? "open" : "closed"} · #${esc(s?.lastSeq ?? "—")} · missing ${esc(s?.missing ?? 0)}</div>
+      <div class="tags">
+        <span class="tag ${d.online ? "ok" : "bad"}">${d.online ? "Online" : "Offline"}</span>
+        ${d.highTemperature ? '<span class="tag bad">Alarm</span>' : ""}
+        ${d.doorOpen ? '<span class="tag warn">Door open</span>' : ""}
+      </div></div>`;
+  }).join("");
+  renderChart(histories);
+}
+
+function renderChart(histories) {
+  const series = fridgeIds.map(id => ({
+    id,
+    points: (histories[id] ?? []).map(h => h.event)
+      .filter(e => (e.messageType === "DDATA" || e.messageType === "DBIRTH") && num(e.metrics, "Temperature") != null)
+      .map(e => ({ t: new Date(e.recordedAt).getTime(), v: num(e.metrics, "Temperature"), hist: e.historical }))
+      .sort((a, b) => a.t - b.t).slice(-60)
+  }));
+  $("legend").innerHTML = fridgeIds.map(id => `<span><i style="background:${color(id)}"></i>${esc(id)}</span>`).join("") +
+    '<span><i class="ring"></i>Replayed (historical)</span><span><i style="background:var(--bad)"></i>Alarm 8 °C</span>';
+  const all = series.flatMap(s => s.points);
+  const svg = $("chart");
+  if (all.length < 2) { svg.innerHTML = '<text x="320" y="120" text-anchor="middle" class="axis-label">Waiting for readings…</text>'; return; }
+  const W = 640, H = 240, L = 36, R = 12, T = 12, B = 26;
+  const t0 = Math.max(Math.min(...all.map(p => p.t)), Math.max(...all.map(p => p.t)) - 4 * 60 * 1000);
+  const t1 = Math.max(...all.map(p => p.t));
+  const visible = all.filter(p => p.t >= t0);
+  const lo = Math.min(2, ...visible.map(p => p.v)) - 1, hi = Math.max(11, ...visible.map(p => p.v)) + 1;
+  const x = t => L + (W - L - R) * (t - t0) / Math.max(1, t1 - t0);
+  const y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+  const ticks = [...new Set([Math.ceil(lo), 4, 8, Math.floor(hi)])];
+  const fmt = t => new Date(t).toLocaleTimeString([], { hour12: false });
+  svg.innerHTML = `
+    ${ticks.map(v => `<line class="axis" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="axis-label" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}°</text>`).join("")}
+    <line class="threshold" x1="${L}" x2="${W - R}" y1="${y(8)}" y2="${y(8)}"/>
+    ${series.map(s => {
+      const pts = s.points.filter(p => p.t >= t0);
+      return `<polyline class="series" style="stroke:${color(s.id)}" points="${pts.map(p => `${x(p.t)},${y(p.v)}`).join(" ")}"/>` +
+        pts.filter(p => p.hist).map(p => `<circle class="hist" cx="${x(p.t)}" cy="${y(p.v)}" r="4"><title>${esc(s.id)}: ${p.v} °C at ${fmt(p.t)} (historical)</title></circle>`).join("");
+    }).join("")}
+    <text class="axis-label" x="${L}" y="${H - 6}">${fmt(t0)}</text>
+    <text class="axis-label" x="${W - R}" y="${H - 6}" text-anchor="end">${fmt(t1)}</text>`;
+}
+
+// Feed
+function describe(e) {
+  const m = e.metrics || {};
+  switch (e.messageType) {
+    case "NBIRTH": return `gateway ${e.gatewayId} born · bdSeq ${e.bdSeq}`;
+    case "NDEATH": return `gateway ${e.gatewayId} died · bdSeq ${e.bdSeq}`;
+    case "NDATA": return `heartbeat · uptime ${num(m, "UptimeSeconds") ?? "—"}s`;
+    case "DDEATH": return `${e.deviceId} lost`;
+    default: {
+      const seq = num(m, "DeviceSeq");
+      return `${e.deviceId} ${e.messageType === "DBIRTH" ? "born " : ""}${seq != null ? "#" + seq : ""} · ${num(m, "Temperature")} °C · ${num(m, "Humidity")}% · door ${num(m, "GpioValue") === 1 ? "open" : "closed"}`;
+    }
+  }
+}
+
+async function renderFeed() {
+  const names = ["gateway", "backend", ...fridgeIds];
+  $("tabnote").innerHTML = esc(TAB_NOTES[tab]) + (tab === "logs"
+    ? ` <select id="log-name">${names.map(n => `<option${n === logName ? " selected" : ""}>${n}</option>`).join("")}</select>` : "");
+  const feed = $("feed");
+  try {
+    if (tab === "logs") {
+      const lines = await getJson("/api/logs/" + logName);
+      const atBottom = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 20;
+      feed.innerHTML = `<pre class="logs">${esc(lines.join("\n")) || "No output yet."}</pre>`;
+      if (atBottom) feed.scrollTop = feed.scrollHeight;
+      return;
+    }
+    if (tab === "stored") {
+      const events = backend?.events ?? [];
+      const previous = lastEventId;
+      lastEventId = Math.max(lastEventId, events[0]?.id ?? 0);
+      feed.innerHTML = events.length ? events.map(({ id, appliedToState, event: e }) => `
+        <div class="row${previous && id > previous ? " new" : ""}">
+          <time>${esc(time(e.recordedAt ?? e.observedAt))}</time>
+          <span class="badge b-${esc(e.messageType)}">${esc(e.messageType)}</span>
+          <span class="text">${e.deviceId ? `<span class="swatch" style="background:${color(e.deviceId)};margin-right:6px"></span>` : ""}${e.historical ? '<span class="tag warn">historical</span>' : ""}${appliedToState ? "" : '<span class="tag">history only</span>'}${e.seq != null ? `<span class="tag">seq ${esc(e.seq)}</span>` : ""}${esc(describe(e))}</span>
+        </div>`).join("") : `<div class="empty">${state?.backendReachable ? "Nothing stored yet." : "Backend is down."}</div>`;
+      return;
+    }
+    const messages = await getJson("/api/wire/" + tab);
+    const previous = lastWireId;
+    lastWireId = Math.max(lastWireId, messages[0]?.id ?? 0);
+    feed.innerHTML = messages.length ? messages.map(m => {
+      const device = fridgeIds.find(id => m.topic.includes("/" + id));
+      return `<div class="row${previous && m.id > previous ? " new" : ""}">
+        <time>${esc(time(m.at))}</time>
+        <span class="badge b-${esc(m.type)}">${esc(m.type)}</span>
+        <span class="text" title="${esc(m.topic)}">${device ? `<span class="swatch" style="background:${color(device)};margin-right:6px"></span>` : ""}${m.seq != null && tab === "upstream" ? `<span class="tag">seq ${esc(m.seq)}</span>` : ""}${m.historical ? '<span class="tag warn">historical</span>' : ""}${m.retained ? '<span class="tag">retained</span>' : ""}${device && tab === "upstream" ? esc(device) + " · " : ""}${esc(m.summary)}</span>
+      </div>`;
+    }).join("") : '<div class="empty">No messages seen yet.</div>';
+  } catch {
+    feed.innerHTML = '<div class="empty">Not available right now.</div>';
+  }
+}
+
+// Polling
+async function refresh() {
+  try {
+    state = await getJson("/api/state");
+  } catch {
+    $("backend-pill").className = "pill bad";
+    $("backend-pill").lastElementChild.textContent = "Demo console not reachable";
+    return;
+  }
+  const ids = state.fridges.map(f => f.id);
+  if (ids.join() !== fridgeIds.join()) { fridgeIds = ids; buildPipeline(); }
+  const previousEvent = backend?.events?.[0]?.id ?? 0;
+  if (state.backendReachable) {
+    try {
+      const [gateways, devices, events, summaries, ...histories] = await Promise.all([
+        getJson("/api/backend/gateways"), getJson("/api/backend/devices"),
+        getJson("/api/backend/events?limit=200"), getJson("/api/backend/events/summary"),
+        ...fridgeIds.map(id => getJson(`/api/backend/devices/${encodeURIComponent(id)}/history?limit=120`).catch(() => []))]);
+      backend = { gateways, devices, events, summaries, histories: Object.fromEntries(fridgeIds.map((id, i) => [id, histories[i]])) };
+    } catch { /* keep the last known data */ }
+  }
+  renderPipeline();
+  renderGateway();
+  renderControls();
+  renderScenario();
+  renderBackend();
+  const fresh = previousEvent ? (backend?.events ?? []).filter(e => e.id > previousEvent) : [];
+  const readers = [...new Set(fresh.filter(e => /^D(DATA|BIRTH)$/.test(e.event.messageType)).map(e => e.event.deviceId))];
+  if (readers.length) pulse(...readers, "gateway", "mosquitto", "backend");
+  else if (fresh.length) pulse("mosquitto", "backend");
+  else if (state.gateway?.unsent > 0 || !state.backendReachable)
+    pulse(...state.fridges.filter(f => f.running && !f.controls.paused).map(f => f.id), "gateway");
+  await renderFeed();
+}
+
+document.addEventListener("click", e => {
+  const act = e.target.closest("[data-act]");
+  if (act) { const [name, action] = act.dataset.act.split("/"); post(`/api/components/${name}/${action}`, `${CORE[name]?.label ?? name}: ${action}`); return; }
+  const cmd = e.target.closest("[data-cmd]");
+  if (cmd) { const [id, command] = cmd.dataset.cmd.split("/"); post(`/api/fridges/${id}/${command}`, `${id}: ${cmd.textContent.toLowerCase()}`); return; }
+  const demo = e.target.closest("[data-demo]");
+  if (demo) {
+    if (demo.dataset.demo === "reset" && !confirm("Reset wipes the broker data and demo state, then starts everything fresh. Continue?")) return;
+    post(`/api/demo/${demo.dataset.demo}`, demo.textContent);
+    return;
+  }
+  const t = e.target.closest(".tab");
+  if (t) { tab = t.dataset.tab; lastWireId = 0; document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t)); renderFeed(); }
+});
+document.addEventListener("change", e => { if (e.target.id === "log-name") { logName = e.target.value; renderFeed(); } });
+$("run-test").onclick = () => post("/api/demo/resilience", "Starting resilience test");
+
+(async function loop() { await refresh(); setTimeout(loop, 1000); })();
+</script>
+</body>
+</html>

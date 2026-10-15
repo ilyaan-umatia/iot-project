@@ -18,3 +18,21 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - mosquitto-data:/mosquitto/data
+
+  edge-mosquitto:
+    image: eclipse-mosquitto:2.1.2-alpine
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - type: bind
+        source: ./broker/mosquitto-edge.conf
+        target: /mosquitto/config/mosquitto.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - edge-mosquitto-data:/mosquitto/data
+
+volumes:
+  mosquitto-data:
+  edge-mosquitto-data:

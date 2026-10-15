@@ -1,29 +1,37 @@
 using System.Diagnostics;
 using Device.Gateway.Configuration;
-using Device.Gateway.Simulation;
 using Device.Gateway.Sparkplug;
+using Device.Gateway.Storage;
 using Google.Protobuf;
+using MQTTnet.Protocol;
 
 namespace Device.Gateway.Connection;
 
-public sealed class GatewayRunner(MqttConnection connection, GatewaySettings settings)
+public sealed class GatewayRunner(MqttConnection connection, Outbox outbox, GatewaySettings settings)
 {
-    private volatile bool _deviceOnline = true;
-    public void SetDeviceOnline(bool online) => _deviceOnline = online;
+    private readonly PrimaryHostState _host = new();
+    private int _rebirthRequested;
     private readonly long _startedAt = Stopwatch.GetTimestamp();
     private ulong UptimeSeconds => (ulong)Stopwatch.GetElapsedTime(_startedAt).TotalSeconds;
+    private bool HostRequired => !string.IsNullOrWhiteSpace(settings.Sparkplug.HostId);
+    public bool HostOnline => !HostRequired || _host.IsOnline;
+    public string? LastPublished { get; private set; }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         var mqtt = settings.Mqtt;
         if (mqtt.RetryDelaySeconds <= 0 || mqtt.MaxRetryDelaySeconds < mqtt.RetryDelaySeconds)
             throw new ArgumentException("Retry delays must be positive and the maximum must be at least the initial delay.");
-        if (settings.Device.ReadingIntervalSeconds <= 0)
-            throw new ArgumentException("Reading interval must be positive.");
-        if (settings.Device.GpioPin < 0)
-            throw new ArgumentException("GPIO pin must not be negative.");
-        _ = SparkplugTopics.DeviceBirth(settings.Sparkplug, settings.Device.DeviceId);
-        var topic = SparkplugTopics.NodeBirth(settings.Sparkplug);
+        if (settings.Gateway.PublishBatchSize <= 0 || settings.Gateway.NodeDataIntervalSeconds <= 0)
+            throw new ArgumentException("Publish batch size and node data interval must be positive.");
+        var commandTopic = SparkplugTopics.NodeCommand(settings.Sparkplug);
+        var stateTopic = HostRequired ? SparkplugTopics.PrimaryHostState(settings.Sparkplug.HostId) : null;
+        connection.MessageReceived += (topic, payload) =>
+        {
+            if (topic == stateTopic) _host.Apply(payload);
+            else if (topic == commandTopic) RequestRebirth(payload);
+            return Task.CompletedTask;
+        };
         var delaySeconds = mqtt.RetryDelaySeconds;
         var attempt = 0;
         while (!cancellationToken.IsCancellationRequested)
@@ -33,9 +41,19 @@ public sealed class GatewayRunner(MqttConnection connection, GatewaySettings set
                 Console.WriteLine($"Connecting {mqtt.ClientId} to {mqtt.Host}:{mqtt.Port}...");
                 await connection.ConnectAsync(cancellationToken);
                 Console.WriteLine("Connected.");
-                await connection.PublishAsync(topic,
-                    SparkplugPayloads.NodeBirth(connection.BirthDeathSequence, UptimeSeconds).ToByteArray(), cancellationToken);
-                Console.WriteLine($"Published NBIRTH: {topic}");
+                _host.Reset();
+                // Subscribe before the birth so the host's STATE and rebirth commands are not missed.
+                await connection.SubscribeAsync(stateTopic is null ? [commandTopic] : [commandTopic, stateTopic],
+                    cancellationToken);
+                if (HostRequired && !_host.CameOnline.IsCompleted)
+                {
+                    Console.WriteLine($"Waiting for primary host {settings.Sparkplug.HostId}. Buffering readings meanwhile.");
+                    var disconnected = connection.WaitForDisconnectAsync(cancellationToken);
+                    if (await Task.WhenAny(_host.CameOnline, disconnected) != _host.CameOnline)
+                        throw new InvalidOperationException("Disconnected while waiting for the primary host.");
+                }
+                Interlocked.Exchange(ref _rebirthRequested, 0);
+                await PublishNodeBirthAsync(cancellationToken);
                 if (!connection.MarkOnline())
                     throw new InvalidOperationException("Connection closed during the birth announcement.");
                 attempt = 0;
@@ -53,9 +71,23 @@ public sealed class GatewayRunner(MqttConnection connection, GatewaySettings set
             cancellationToken.ThrowIfCancellationRequested();
             await connection.PrepareRetryAsync(cancellationToken);
             attempt++;
-            Console.WriteLine($"Retry {attempt} in {delaySeconds}s.");
+            Console.WriteLine($"Retry {attempt} in {delaySeconds}s. {outbox.CountUnsent()} message(s) buffered.");
             await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
             delaySeconds = (int)Math.Min((long)delaySeconds * 2, mqtt.MaxRetryDelaySeconds);
+        }
+    }
+
+    private void RequestRebirth(byte[] payload)
+    {
+        try
+        {
+            if (!SparkplugPayloads.IsRebirthCommand(payload)) return;
+            Interlocked.Exchange(ref _rebirthRequested, 1);
+            Console.WriteLine("Rebirth requested by host.");
+        }
+        catch (InvalidProtocolBufferException)
+        {
+            Console.WriteLine("Ignored invalid NCMD.");
         }
     }
 
@@ -63,55 +95,119 @@ public sealed class GatewayRunner(MqttConnection connection, GatewaySettings set
     {
         using var session = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var disconnected = connection.WaitForDisconnectAsync(session.Token);
-        var publishing = PublishReadingsAsync(session.Token, cancellationToken);
+        var hostOffline = _host.WentOffline;
+        var publishing = DrainAsync(session.Token);
         try
         {
-            if (await Task.WhenAny(disconnected, publishing) == publishing)
-                await publishing;
-            await disconnected;
+            var finished = await Task.WhenAny(disconnected, publishing, hostOffline);
+            if (finished == publishing) await publishing;
+            else if (finished == hostOffline)
+                Console.WriteLine("Primary host went offline. Ending session and buffering until it returns.");
+            else await disconnected;
         }
         finally
         {
             session.Cancel();
             try { await publishing; }
             catch (OperationCanceledException) when (session.IsCancellationRequested) { }
+            catch (Exception) when (session.IsCancellationRequested) { }
             try { await disconnected; }
             catch (OperationCanceledException) when (session.IsCancellationRequested) { }
         }
     }
 
-    private async Task PublishReadingsAsync(CancellationToken cancellationToken, CancellationToken gatewayStopToken)
+    private async Task DrainAsync(CancellationToken cancellationToken)
     {
         var sequence = new SparkplugSequence();
-        var fridge = new FridgeSimulator(connection, settings, sequence);
-        await fridge.InitializeAsync(_deviceOnline, cancellationToken);
+        var sessionStart = DateTimeOffset.UtcNow;
+        await PublishDeviceBirthsAsync(sequence, cancellationToken);
+        var nodeDataInterval = TimeSpan.FromSeconds(settings.Gateway.NodeDataIntervalSeconds);
+        var nextNodeData = DateTime.UtcNow + nodeDataInterval;
+        var nextPrune = DateTime.UtcNow;
+        var announcedBacklog = false;
         var nodeTopic = SparkplugTopics.NodeData(settings.Sparkplug);
 
-        // One loop preserves the publish order across node and device messages.
-        try
+        // One loop preserves the publish order and the shared sequence across node and device messages.
+        while (true)
         {
-            while (true)
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Interlocked.Exchange(ref _rebirthRequested, 0) == 1)
             {
-                await Task.Delay(TimeSpan.FromSeconds(settings.Device.ReadingIntervalSeconds), cancellationToken);
+                await PublishNodeBirthAsync(cancellationToken);
+                sequence = new SparkplugSequence();
+                await PublishDeviceBirthsAsync(sequence, cancellationToken);
+            }
+            if (DateTime.UtcNow >= nextNodeData)
+            {
                 var current = sequence.Next();
-                var uptime = UptimeSeconds;
-                await connection.PublishAsync(nodeTopic,
-                    SparkplugPayloads.NodeData(current, uptime).ToByteArray(), cancellationToken);
-                Console.WriteLine($"NDATA {settings.Sparkplug.EdgeNodeId}: uptime={uptime}s (seq {current})");
-                await fridge.UpdateAsync(_deviceOnline, cancellationToken);
+                await connection.PublishAsync(nodeTopic, SparkplugPayloads.NodeData(current, UptimeSeconds).ToByteArray(),
+                    cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
+                nextNodeData = DateTime.UtcNow + nodeDataInterval;
+            }
+            if (DateTime.UtcNow >= nextPrune)
+            {
+                outbox.PruneSent(TimeSpan.FromHours(settings.Gateway.KeepSentHours));
+                nextPrune = DateTime.UtcNow.AddHours(1);
+            }
+
+            var rows = outbox.PeekUnsent(settings.Gateway.PublishBatchSize);
+            if (rows.Length == 0)
+            {
+                await outbox.WaitForRowsAsync(TimeSpan.FromSeconds(1), cancellationToken);
+                continue;
+            }
+            if (!announcedBacklog && rows[0].CreatedAt < sessionStart)
+            {
+                Console.WriteLine($"Replaying {outbox.CountUnsent()} buffered message(s).");
+                announcedBacklog = true;
+            }
+            foreach (var row in rows)
+            {
+                if (Volatile.Read(ref _rebirthRequested) == 1) break;
+                await PublishRowAsync(row, sequence.Next(), row.CreatedAt < sessionStart, cancellationToken);
+                outbox.MarkSent(row);
             }
         }
-        finally
+    }
+
+    private async Task PublishRowAsync(OutboxRow row, ulong sequence, bool historical, CancellationToken cancellationToken)
+    {
+        var (topic, payload) = row.Kind switch
         {
-            if (gatewayStopToken.IsCancellationRequested && connection.IsConnected)
-            {
-                using var deviceStop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                try { await fridge.UpdateAsync(false, deviceStop.Token); }
-                catch (Exception error)
-                {
-                    Console.WriteLine($"Device shutdown failed ({error.GetType().Name}).");
-                }
-            }
+            "DBIRTH" => (SparkplugTopics.DeviceBirth(settings.Sparkplug, row.DeviceId),
+                SparkplugPayloads.DeviceReading(sequence, row.Reading!)),
+            "DDATA" => (SparkplugTopics.DeviceData(settings.Sparkplug, row.DeviceId),
+                SparkplugPayloads.DeviceReading(sequence, row.Reading!, historical)),
+            "DDEATH" => (SparkplugTopics.DeviceDeath(settings.Sparkplug, row.DeviceId),
+                SparkplugPayloads.DeviceDeath(sequence)),
+            _ => throw new InvalidOperationException($"Unknown outbox message {row.Kind}.")
+        };
+        await connection.PublishAsync(topic, payload.ToByteArray(), cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
+        var detail = row.Reading is { } reading
+            ? $" #{reading.DeviceSeq}: temperature={reading.Temperature}C, GPIO {reading.GpioPin}={reading.GpioValue}" : "";
+        LastPublished = $"{row.Kind} {row.DeviceId}{(row.Reading is { } sent ? $" #{sent.DeviceSeq}" : "")}";
+        Console.WriteLine($"{row.Kind} {row.DeviceId}{detail} (seq {sequence}{(historical ? ", historical" : "")})");
+    }
+
+    private async Task PublishNodeBirthAsync(CancellationToken cancellationToken)
+    {
+        var topic = SparkplugTopics.NodeBirth(settings.Sparkplug);
+        await connection.PublishAsync(topic,
+            SparkplugPayloads.NodeBirth(connection.BirthDeathSequence, UptimeSeconds).ToByteArray(),
+            cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
+        Console.WriteLine($"Published NBIRTH: {topic} (bdSeq {connection.BirthDeathSequence})");
+    }
+
+    // Births describe what the backend last received, so the following backlog continues from there.
+    private async Task PublishDeviceBirthsAsync(SparkplugSequence sequence, CancellationToken cancellationToken)
+    {
+        foreach (var reading in outbox.GetPublishedOnlineDevices())
+        {
+            var current = sequence.Next();
+            var topic = SparkplugTopics.DeviceBirth(settings.Sparkplug, reading.DeviceId);
+            await connection.PublishAsync(topic, SparkplugPayloads.DeviceReading(current, reading).ToByteArray(),
+                cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
+            Console.WriteLine($"Published DBIRTH: {topic} (seq {current})");
         }
     }
 }

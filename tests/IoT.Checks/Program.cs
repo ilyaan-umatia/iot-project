@@ -1,5 +1,4 @@
 using Application.Api.Services;
-using Cloud.Forwarder;
 using Device.Gateway.Sparkplug;
 using Google.Protobuf;
 using IoT.Contracts;
@@ -19,13 +18,25 @@ LifecycleEvent Send(string type, Payload payload)
     state.Process(JsonSerializer.Deserialize<LifecycleEvent>(json)!);
     return item;
 }
+bool SendNeedsRebirth(string type, Payload payload)
+{
+    var topic = prefix + type + "/gateway-01" + (type.StartsWith('D') ? "/fridge-01" : "");
+    var item = decoder.Decode(topic, payload.ToByteArray(), out var needsRebirth);
+    state.Process(item); // out-of-sync messages are still stored
+    return needsRebirth;
+}
+static bool NeedsRebirth(SparkplugDecoder target, string topic, Payload payload)
+{
+    target.Decode(topic, payload.ToByteArray(), out var needsRebirth);
+    return needsRebirth;
+}
 void Check(bool condition, string reason) { if (!condition) throw new Exception(reason); }
 void Reject(Action action)
 {
     try { action(); } catch (ArgumentException) { return; }
     throw new Exception("Invalid event was accepted.");
 }
-Reject(() => Send("DDATA", SparkplugPayloads.DeviceReading(1, 5, 60, 17, 0)));
+Check(SendNeedsRebirth("DDATA", SparkplugPayloads.DeviceReading(1, 5, 60, 17, 0)), "Data before birth did not request rebirth.");
 Send("NBIRTH", SparkplugPayloads.NodeBirth(7));
 var birth = Send("DBIRTH", SparkplugPayloads.DeviceReading(1, 4.5, 65, 17, 0));
 Check(!birth.Metrics.ContainsKey("DoorOpen"), "Gateway should send raw GPIO input.");
@@ -47,8 +58,8 @@ Send("NDEATH", SparkplugPayloads.NodeDeath(7));
 Check(!state.GetGateways().Single().Online && !state.GetDevices().Single().Online, "Node loss did not invalidate devices.");
 Send("NBIRTH", SparkplugPayloads.NodeBirth(8, 12));
 Send("DBIRTH", SparkplugPayloads.DeviceReading(1, 5, 69, 17, 0));
-Reject(() => Send("NDATA", SparkplugPayloads.NodeData(3, 15)));
-Reject(() => Send("NDATA", SparkplugPayloads.NodeData(4, 20)));
+Check(SendNeedsRebirth("NDATA", SparkplugPayloads.NodeData(3, 15)), "Sequence gap did not request rebirth.");
+Check(SendNeedsRebirth("NDATA", SparkplugPayloads.NodeData(4, 20)), "Data after a gap did not request rebirth.");
 Send("NBIRTH", SparkplugPayloads.NodeBirth(9));
 Send("DBIRTH", SparkplugPayloads.DeviceReading(1, 5, 69, 17, 0));
 for (ulong seq = 2; seq <= 255; seq++) Send("NDATA", SparkplugPayloads.NodeData(seq, seq));
@@ -80,13 +91,13 @@ Reject(() => state.Process(birth with { EventId = "wildcard", GroupId = "+", Sou
 Console.WriteLine("PASS: GPIO door mapping, binary decoding, JSON roundtrip, lifecycle/recovery, duplicates, stale death, sequence gaps/wrap and validation.");
 
 var restartedDecoder = new SparkplugDecoder();
-Reject(() => restartedDecoder.Decode(prefix + "NDATA/gateway-01", SparkplugPayloads.NodeData(2, 5).ToByteArray()));
+Check(NeedsRebirth(restartedDecoder, prefix + "NDATA/gateway-01", SparkplugPayloads.NodeData(2, 5)), "Cold start did not request rebirth.");
 var offlineWithoutBirth = restartedDecoder.Decode(prefix + "NDEATH/gateway-01", SparkplugPayloads.NodeDeath(9).ToByteArray());
 Check(offlineWithoutBirth is { MessageType: "NDEATH", BdSeq: 9 }, "Independent forwarder lost death without a local birth cache.");
 restartedDecoder.Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(10).ToByteArray());
 restartedDecoder.Decode(prefix + "DBIRTH/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(1, 5, 65, 17, 0).ToByteArray());
 restartedDecoder.Reset();
-Reject(() => restartedDecoder.Decode(prefix + "DDATA/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(2, 5, 65, 17, 0).ToByteArray()));
+Check(NeedsRebirth(restartedDecoder, prefix + "DDATA/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(2, 5, 65, 17, 0)), "Reset did not request rebirth.");
 restartedDecoder.Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(11).ToByteArray());
 restartedDecoder.Decode(prefix + "DBIRTH/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(1, 5, 65, 17, 0).ToByteArray());
 Check(restartedDecoder.Decode(prefix + "DDATA/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(2, 6, 65, 17, 0).ToByteArray()).Metrics["Temperature"].Number == 6,
@@ -257,4 +268,71 @@ using (var historyStore = new TelemetryStore(":memory:"))
     Check(history.GetDevice("fridge-01")!.RecordedAt == time.AddSeconds(799),
         "Concurrent older events overwrote the latest device state.");
     Console.WriteLine("PASS: Complete history across 500-record pages and concurrent storage/retrieval.");
+}
+
+var nodeBirth = new SparkplugDecoder().Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(3).ToByteArray());
+Check(nodeBirth.Metrics["Node Control/Rebirth"].Boolean == false, "NBIRTH is missing Node Control/Rebirth.");
+var readingTime = DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+var sample = new DeviceReading("fridge-01", 42, readingTime, 4.5, 65, 17, 0);
+LifecycleEvent DecodeReplay(byte bdSeq, ulong seq, bool historical)
+{
+    var target = new SparkplugDecoder();
+    target.Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(bdSeq).ToByteArray());
+    target.Decode(prefix + "DBIRTH/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(1, sample).ToByteArray());
+    for (ulong next = 2; next < seq; next++)
+        target.Decode(prefix + "NDATA/gateway-01", SparkplugPayloads.NodeData(next, next).ToByteArray());
+    return target.Decode(prefix + "DDATA/gateway-01/fridge-01",
+        SparkplugPayloads.DeviceReading(seq, sample, historical).ToByteArray());
+}
+var live = DecodeReplay(1, 2, false);
+var replayed = DecodeReplay(2, 5, true);
+Check(live.EventId == replayed.EventId && live.EventId.EndsWith("/reading/42"),
+    "A replayed reading in a new session did not keep its event ID.");
+Check(replayed.Historical && !live.Historical && replayed.RecordedAt == readingTime, "Historical flag or original time was lost.");
+using (var replayStore = new TelemetryStore(":memory:"))
+{
+    var replayState = new GpioMessageService(replayStore);
+    replayState.Process(Event("NBIRTH", 0, 0, 1));
+    replayState.Process(Event("DBIRTH", 1, 1));
+    replayState.Process(live);
+    replayState.Process(replayed);
+    Check(replayState.GetHistory("fridge-01").Count(row => row.Event.EventId == live.EventId) == 1,
+        "Replay after a gateway crash duplicated a reading.");
+}
+Console.WriteLine("PASS: Rebirth metric, deterministic reading IDs across sessions, historical replay and deduplication.");
+
+var outboxDirectory = Path.Combine(Path.GetTempPath(), "gateway-outbox-" + Guid.NewGuid().ToString("N"));
+var outboxPath = Path.Combine(outboxDirectory, "outbox.db");
+try
+{
+    DeviceReading Reading(ulong seq) => sample with { DeviceSeq = seq };
+    using (var outbox = new Device.Gateway.Storage.Outbox(outboxPath))
+    {
+        Check(outbox.AcceptReading(Reading(1)) && outbox.AcceptReading(Reading(2)), "Readings were not buffered.");
+        Check(!outbox.AcceptReading(Reading(2)), "Redelivered reading was buffered twice.");
+        Check(outbox.AcceptDeviceOffline("fridge-01") && !outbox.AcceptDeviceOffline("fridge-01"), "Offline status mishandled.");
+        Check(outbox.AcceptReading(Reading(3)), "Reading after offline was not buffered.");
+        var rows = outbox.PeekUnsent(10);
+        Check(rows.Select(row => row.Kind).SequenceEqual(["DBIRTH", "DDATA", "DDEATH", "DBIRTH"]),
+            "Outbox lifecycle order is wrong.");
+        outbox.MarkSent(rows[0]);
+        outbox.MarkSent(rows[1]);
+        Check(outbox.GetPublishedOnlineDevices().Single().DeviceSeq == 2, "Published device state is wrong.");
+    }
+    using (var reopened = new Device.Gateway.Storage.Outbox(outboxPath))
+    {
+        var rows = reopened.PeekUnsent(10);
+        Check(rows.Length == 2 && rows[0].Kind == "DDEATH" && rows[1].Reading!.DeviceSeq == 3,
+            "Unsent rows did not survive a restart in order.");
+        Check(!reopened.AcceptReading(Reading(1)), "Restart forgot already buffered readings.");
+        reopened.MarkSent(rows[0]);
+        Check(reopened.GetPublishedOnlineDevices().Length == 0, "Device death did not update published state.");
+        Check(reopened.CountUnsent() == 1, "Unsent count is wrong.");
+    }
+    Console.WriteLine("PASS: Gateway outbox order, deduplication, device lifecycle and restart recovery.");
+}
+finally
+{
+    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    if (Directory.Exists(outboxDirectory)) Directory.Delete(outboxDirectory, recursive: true);
 }

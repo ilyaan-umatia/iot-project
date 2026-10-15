@@ -1,7 +1,6 @@
-using IoT.Contracts;
 using Org.Eclipse.Tahu.Protobuf;
 
-namespace Cloud.Forwarder;
+namespace IoT.Contracts;
 
 public sealed class SparkplugDecoder
 {
@@ -15,10 +14,15 @@ public sealed class SparkplugDecoder
         lock (_gate) { _nodes.Clear(); _sequences.Clear(); _devices.Clear(); }
     }
 
-    public LifecycleEvent Decode(string topic, byte[] bytes)
+    public LifecycleEvent Decode(string topic, byte[] bytes) => Decode(topic, bytes, out _);
+
+    // Out-of-sync messages (missing birth, sequence gap) are still returned so the caller can store them,
+    // with needsRebirth set so the host asks the edge node to resynchronize.
+    public LifecycleEvent Decode(string topic, byte[] bytes, out bool needsRebirth)
     {
         lock (_gate)
         {
+            needsRebirth = false;
             var parts = topic.Split('/');
             if (parts.Length is not (4 or 5) || parts[0] != "spBv1.0" || parts.Any(string.IsNullOrWhiteSpace))
                 throw new ArgumentException("Invalid Sparkplug topic.");
@@ -35,15 +39,13 @@ public sealed class SparkplugDecoder
                 throw new ArgumentException("Invalid timestamp.");
             var node = parts[1] + "/" + parts[3];
             var device = parts.Length == 5 ? node + "/" + parts[4] : null;
-            if ((type is "NDATA" or "DBIRTH" or "DDATA" or "DDEATH") && !_nodes.ContainsKey(node))
-                throw new ArgumentException("NBIRTH required. Reconnect the gateway to synchronize.");
-            if ((type is "DDATA" or "DDEATH") && !_devices.Contains(device!))
-                throw new ArgumentException("DBIRTH required before device updates.");
             var metrics = new Dictionary<string, MetricValue>(StringComparer.Ordinal);
             ulong? bdSeq = null;
+            var historical = false;
             foreach (var metric in payload.Metrics)
             {
                 if (!metric.HasName) throw new ArgumentException("Named metrics are required by this decoder.");
+                historical |= metric.IsHistorical;
                 if (metric.Name == "bdSeq")
                 {
                     if (!metric.HasLongValue || metric.LongValue > 255) throw new ArgumentException("Invalid bdSeq.");
@@ -60,17 +62,20 @@ public sealed class SparkplugDecoder
             if ((type is "NBIRTH" or "NDEATH") && bdSeq is null) throw new ArgumentException("Missing bdSeq.");
             if (type == "NDEATH" && _nodes.TryGetValue(node, out var currentSession) && currentSession != bdSeq)
                 throw new ArgumentException("Ignored NDEATH from an older session.");
-            var recordedAt = payload.HasTimestamp
-                ? DateTimeOffset.FromUnixTimeMilliseconds(checked((long)payload.Timestamp)) : (DateTimeOffset?)null;
+            if (type == "NBIRTH" && payload.Seq != 0) throw new ArgumentException("NBIRTH must use seq 0.");
+
+            if ((type is "NDATA" or "DBIRTH" or "DDATA" or "DDEATH") && !_nodes.ContainsKey(node))
+                needsRebirth = true;
+            else if ((type is "DDATA" or "DDEATH") && !_devices.Contains(device!))
+                needsRebirth = true;
             if (type is not ("NBIRTH" or "NDEATH") && _sequences.TryGetValue(node, out var previous) &&
                 payload.Seq != (previous + 1) % 256)
             {
                 _nodes.Remove(node);
-                throw new ArgumentException("Sequence gap. Reconnect the gateway to synchronize.");
+                needsRebirth = true;
             }
             if (type == "NBIRTH")
             {
-                if (payload.Seq != 0) throw new ArgumentException("NBIRTH must use seq 0.");
                 _nodes[node] = bdSeq!.Value;
                 _devices.RemoveWhere(key => key.StartsWith(node + "/", StringComparison.Ordinal));
             }
@@ -83,10 +88,20 @@ public sealed class SparkplugDecoder
                 _devices.RemoveWhere(key => key.StartsWith(node + "/", StringComparison.Ordinal));
             }
             else _sequences[node] = payload.Seq;
-            return new(Guid.NewGuid().ToString("N"), type, parts[1], parts[3],
+
+            // Deterministic IDs let the backend drop redelivered and replayed messages.
+            var session = bdSeq ?? (_nodes.TryGetValue(node, out var known) ? known : null);
+            var eventId = type == "DDATA" && metrics.GetValueOrDefault("DeviceSeq")?.Number is { } deviceSeq
+                ? $"{device}/reading/{deviceSeq}"
+                : type == "NDEATH"
+                    ? $"{node}/NDEATH/{bdSeq}"
+                    : $"{device ?? node}/{type}/{session?.ToString() ?? "-"}/{payload.Seq}/{payload.Timestamp}";
+            var recordedAt = payload.HasTimestamp
+                ? DateTimeOffset.FromUnixTimeMilliseconds(checked((long)payload.Timestamp)) : (DateTimeOffset?)null;
+            return new(eventId, type, parts[1], parts[3],
                 parts.Length == 5 ? parts[4] : null, topic, DateTimeOffset.UtcNow,
                 recordedAt,
-                payload.HasSeq ? payload.Seq : null, bdSeq, metrics);
+                payload.HasSeq ? payload.Seq : null, bdSeq, metrics, historical);
         }
     }
 }

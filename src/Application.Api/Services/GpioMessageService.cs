@@ -137,6 +137,14 @@ public sealed class GpioMessageService(TelemetryStore store)
         lock (_gate) return store.FindDevice(deviceId);
     }
 
+    public HistoryEntry[] GetRecentEvents(int limit = 100)
+    {
+        if (limit is < 1 or > 500) throw new ArgumentException("Invalid event page.");
+        lock (_gate) return store.GetRecentEvents(limit);
+    }
+
+    public DeviceSummary[] GetSummaries() { lock (_gate) return store.GetSummaries(); }
+
     public HistoryEntry[] GetHistory(string deviceId, int limit = 100, long? before = null)
     {
         if (limit is < 1 or > 500 || before is <= 0) throw new ArgumentException("Invalid history page.");
