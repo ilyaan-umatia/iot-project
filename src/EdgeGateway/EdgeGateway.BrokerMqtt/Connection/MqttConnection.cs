@@ -1,14 +1,14 @@
 using System.Buffers;
 using System.Security.Cryptography.X509Certificates;
-using Device.Gateway.Configuration;
-using Device.Gateway.Sparkplug;
+using EdgeGateway.BrokerMqtt.Configuration;
+using EdgeGateway.BrokerMqtt.Sparkplug;
 using Google.Protobuf;
 using MQTTnet;
 using MQTTnet.Formatter;
 using MQTTnet.Exceptions;
 using MQTTnet.Protocol;
 
-namespace Device.Gateway.Connection;
+namespace EdgeGateway.BrokerMqtt.Connection;
 
 public sealed class MqttConnection : IDisposable
 {

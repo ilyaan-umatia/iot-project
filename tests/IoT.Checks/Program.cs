@@ -1,5 +1,5 @@
 using Application.Api.Services;
-using Device.Gateway.Sparkplug;
+using EdgeGateway.BrokerMqtt.Sparkplug;
 using Google.Protobuf;
 using IoT.Contracts;
 using Org.Eclipse.Tahu.Protobuf;
@@ -306,7 +306,7 @@ var outboxPath = Path.Combine(outboxDirectory, "outbox.db");
 try
 {
     DeviceReading Reading(ulong seq) => sample with { DeviceSeq = seq };
-    using (var outbox = new Device.Gateway.Storage.Outbox(outboxPath))
+    using (var outbox = new EdgeGateway.BrokerMqtt.Storage.Outbox(outboxPath))
     {
         Check(outbox.AcceptReading(Reading(1)) && outbox.AcceptReading(Reading(2)), "Readings were not buffered.");
         Check(!outbox.AcceptReading(Reading(2)), "Redelivered reading was buffered twice.");
@@ -319,7 +319,7 @@ try
         outbox.MarkSent(rows[1]);
         Check(outbox.GetPublishedOnlineDevices().Single().DeviceSeq == 2, "Published device state is wrong.");
     }
-    using (var reopened = new Device.Gateway.Storage.Outbox(outboxPath))
+    using (var reopened = new EdgeGateway.BrokerMqtt.Storage.Outbox(outboxPath))
     {
         var rows = reopened.PeekUnsent(10);
         Check(rows.Length == 2 && rows[0].Kind == "DDEATH" && rows[1].Reading!.DeviceSeq == 3,
@@ -336,3 +336,5 @@ finally
     Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     if (Directory.Exists(outboxDirectory)) Directory.Delete(outboxDirectory, recursive: true);
 }
+
+await NetMqChecks.RunAsync();

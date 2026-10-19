@@ -1,68 +1,78 @@
 # IoT Project
 
-Requires .NET 8 SDK, Docker Desktop and Git for Windows.
+Requires .NET 8 SDK, Docker Desktop and MQTTX.
 
+```text
+Simulator(s) → Edge Mosquitto (:1883) → EdgeGateway.DataAcquisition (intake)
+    → NetMQ (:5555) → EdgeGateway.BrokerMqtt [SQLite outbox → Sparkplug B]
+    → Mosquitto over TLS (:8883) → MQTTX
 ```
-Device.Simulator ─MQTT─► edge Mosquitto (:1883) ─► Device.Gateway [SQLite outbox → Sparkplug B]
-    ─MQTT/TLS─► Mosquitto (:8883) ─► Application.Api (Sparkplug Primary Host, SQLite)
-```
 
-- **Device.Simulator** is a fridge. It publishes readings to `edge/{deviceId}/data` at QoS 1. Each reading has a persisted, never-repeating `deviceSeq`. A Last Will on `edge/{deviceId}/status` reports the device offline.
-- **Device.Gateway** is the Sparkplug edge node. It commits every reading to its SQLite outbox before acknowledging it, then publishes the outbox in order (NBIRTH/DBIRTH/DDATA/DDEATH, QoS 1). It waits for the primary host's `STATE`, ends its session (NDEATH) while the host is offline, and replays the backlog as `is_historical` when the host returns. It also answers `Node Control/Rebirth` commands.
-- **Application.Api** is the Sparkplug Primary Host. It holds a persistent MQTT session, publishes `spBv1.0/STATE/{HostId}`, stores each message before acknowledging it, removes duplicates by event ID, and requests a rebirth when out of sync. Its REST API serves `/gateways`, `/devices` and `/devices/{id}/history`.
-- Both brokers keep sessions and queued messages on disk.
+The backend is temporarily outside the active flow. The simulator and edge broker remain as the reading source until the acquisition layer is ready.
 
-Add your settings to the root `appsettings.json` (not included in Git). The defaults in each project's settings classes cover everything else:
+`EdgeGateway.DataAcquisition` keeps the existing edge intake. `EdgeGateway.BrokerMqtt` runs separately and owns the upstream MQTT connection, Sparkplug lifecycle and SQLite outbox. NetMQ Request/Reply connects them; the reply confirms the outbox commit before Gateway acknowledges the edge MQTT message.
+
+## Configuration
+
+Create root `appsettings.json` (ignored by Git). These are the minimum settings; the settings classes provide the other defaults:
 
 ```json
 {
-  "Urls": "http://localhost:5114",
-  "Sparkplug": { "GroupId": "warehouse-01", "EdgeNodeId": "gateway-01", "HostId": "iot-host" },
+  "Sparkplug": { "GroupId": "warehouse-01", "EdgeNodeId": "gateway-01", "HostId": "" },
   "Mqtt": { "Host": "127.0.0.1", "Port": 8883, "ClientId": "gateway-01", "UseTls": true, "BrokerCertificatePath": "certs/broker.crt" }
 }
 ```
 
-Run from the project folder:
+Keep `HostId` empty for this flow. A configured HostId makes the gateway wait for that Primary Host's online STATE. MQTTX does not provide that role.
+
+Both applications default to `NetMq:Endpoint = tcp://127.0.0.1:5555`. EdgeGateway.BrokerMqtt binds; EdgeGateway.DataAcquisition connects. Override that setting in root appsettings.json if the port is occupied. Keep this internal connection local.
+
+When moving an existing setup, keep `Mqtt:StateDirectory` and `Gateway:DatabasePath` pointing to the existing counter and outbox; EdgeGateway.BrokerMqtt owns these now. Without explicit paths, state defaults to the application's output directory. Stop the old combined application before running the split projects. EdgeGateway.DataAcquisition keeps the existing `gateway-01-intake` identity, and EdgeGateway.BrokerMqtt keeps `gateway-01`.
+
+## Run manually
+
+From the project folder:
 
 ```powershell
-./scripts/New-LocalBrokerCertificate.ps1 # first run only
-./scripts/Start-IoT.ps1
-```
-
-Or start the brokers, then run each application in a separate terminal, in this order:
-
-```powershell
+./scripts/New-LocalBrokerCertificate.ps1 # first setup only; reuse existing valid certificates
 docker compose up -d
-dotnet run --project src/Application.Api
-dotnet run --project src/Device.Gateway   # wait for "Intake subscribed"
-dotnet run --project src/Device.Simulator -- --Simulator:DeviceId=fridge-01
 ```
 
-## Demo console
+In MQTTX, connect to `127.0.0.1:8883` with TLS enabled, use `broker/certs/broker.crt` as the trusted certificate, and use a unique client ID (not `gateway-01`). Subscribe to `spBv1.0/warehouse-01/#` before starting the gateway. For Protobuf decoding, import `schemas/sparkplug_b.proto` and select `org.eclipse.tahu.protobuf.Payload`.
+
+Run each application in a separate terminal:
 
 ```powershell
-./scripts/Start-Demo.ps1
+dotnet run --project src/EdgeGateway/EdgeGateway.BrokerMqtt
+dotnet run --project src/EdgeGateway/EdgeGateway.DataAcquisition
+# Wait for "Intake subscribed", then start each simulator:
+dotnet run --project src/Device.Simulator -- --Simulator:DeviceId=fridge-01
+dotnet run --project src/Device.Simulator -- --Simulator:DeviceId=fridge-02
+dotnet run --project src/Device.Simulator -- --Simulator:DeviceId=fridge-03
 ```
 
-This opens `http://127.0.0.1:5200`, a single page that controls and observes everything. It listens on loopback only, because it can start and kill processes on this machine.
+On empty brokers, the gateway must subscribe before the simulators publish so its edge session can hold readings during a gateway outage.
 
-- **Data path:** Start, Stop (clean shutdown) and Crash (kill without warning) for the fridge, the gateway and the backend. Start, Stop, Restart and Crash for both broker containers. **Start all** respects dependency order; **Reset demo** wipes broker data and demo state.
-- **Gateway buffer:** the outbox's unsent count, the upstream state, the host STATE and the session. The gateway writes these to `status.json` beside its outbox, so they stay visible while the backend is down.
-- **Fridge:** open or close the door, start or fix a cooling fault, pause or resume readings. These are sent to the simulator's console input.
-- **Resilience test:** crashes and restarts each component in turn, then checks the backend has every reading the fridge sent, exactly once.
-- **Backend view:** readings stored, missing, duplicates, replayed as historical, the device state and a temperature chart. These are read through the console, so the last known data stays on screen while the backend is down.
-- **On the wire:** live, decoded messages from Mosquitto (Sparkplug, STATE, NCMD) and from the edge broker. A Logs tab shows each component's console output.
+Optional: after subscribing in MQTTX, `./scripts/Start-IoT.ps1` starts the brokers, both applications and one simulator. It does not start the backend. Launcher cleanup force-stops both applications; use manual terminals and type `stop` for graceful shutdown.
 
-Demo state lives in `logs/demo/state`, separate from the projects' default state folders.
+## Check in MQTTX
 
-On the very first run against empty brokers, start the gateway before any device. The edge broker only holds readings for the gateway once its session exists.
+- NBIRTH/DBIRTH announce the node and devices. NDATA reports gateway uptime; DDATA carries readings.
+- Type `stop` in a simulator to see DDEATH; restart it to see DBIRTH. EdgeGateway.BrokerMqtt `stop` publishes NDEATH. Force-stopping it lets Mosquitto publish its NDEATH Last Will once the loss is detected.
+- Stop EdgeGateway.BrokerMqtt: Gateway waits for confirmation and the edge session holds pending readings. Restart it to resume. Stop EdgeGateway.DataAcquisition: EdgeGateway.BrokerMqtt can still drain its outbox; new readings wait at the edge broker until intake returns. Stopping intake alone does not publish NDEATH or mark all devices offline.
+- Stop the upstream broker while simulators continue: the outbox buffers readings. On reconnect, EdgeGateway.BrokerMqtt sends births and replays queued data with historical markers on DDATA.
+- NCMD/Rebirth handling remains available in EdgeGateway.BrokerMqtt. Automatic host requests are absent while the backend is disconnected. Subscribe before EdgeGateway.BrokerMqtt startup to capture births; for a late MQTTX connection, restart EdgeGateway.BrokerMqtt manually to see fresh births.
 
-## Resilience test
+The outbox marks a message sent after the broker acknowledges it. This does not confirm that MQTTX or another subscriber received or processed it. MQTTX being disconnected does not pause publishing.
 
-`./scripts/Test-Resilience.ps1` resets the broker volumes, then kills and restarts each component in turn: backend, gateway, upstream broker, edge broker, simulator. It then checks through the API that every reading arrived exactly once. Logs are written to `logs/resilience-*`.
+## Preserved backend tools
 
-## Known PoC limits
+`Application.Api`, `Demo.Control`, `Start-Demo.ps1` and `Test-Resilience.ps1` are retained for the earlier backend flow. They are not part of this demo. The old dashboard starts the backend, and the resilience script resets broker volumes; do not use them for this workflow. Returning to that flow also requires restoring a matching Primary Host ID.
 
-- Data uses QoS 1 and the host uses a persistent session. This deviates from Sparkplug 3.0, which specifies QoS 0 and clean sessions, so that loss is covered at the MQTT level as well.
-- Not handled: outbox size caps, broker queue limits beyond 100000 messages, edge disk redundancy, clock drift, report-by-exception and metric aliases.
-- A reading whose first delivery was a DBIRTH can appear twice in history if the gateway crashes before marking it sent. DDATA readings are deduplicated by `deviceSeq`.
+## Checks and existing limits
+
+```powershell
+dotnet run --project tests/IoT.Checks
+```
+
+Existing Sparkplug deviations remain: data uses QoS 1 and the retained backend uses a persistent MQTT session. Outbox size limits, clock drift and metric aliases are not handled. A crash after broker acceptance but before marking a row sent can cause redelivery; a DBIRTH reading can appear twice in backend history.

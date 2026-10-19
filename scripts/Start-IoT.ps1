@@ -10,6 +10,9 @@ try {
         throw 'Create root appsettings.json using the settings in README.md.'
     }
     $settings = Get-Content -LiteralPath (Join-Path $workspace 'appsettings.json') -Raw | ConvertFrom-Json
+    if (-not [string]::IsNullOrWhiteSpace($settings.Sparkplug.HostId)) {
+        throw 'Set Sparkplug:HostId to an empty string in appsettings.json to run without the backend.'
+    }
     if (-not $NoBuild) {
         dotnet build IoT.sln --nologo --verbosity quiet
         if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
@@ -20,7 +23,8 @@ try {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 
     function Start-Service([string]$name) {
-        $assembly = Join-Path $workspace "src/$name/bin/Debug/net8.0/$name.dll"
+        $sourceRoot = if ($name.StartsWith('EdgeGateway.')) { 'src/EdgeGateway' } else { 'src' }
+        $assembly = Join-Path $workspace "$sourceRoot/$name/bin/Debug/net8.0/$name.dll"
         Start-Process -FilePath (Get-Command dotnet).Source `
             -ArgumentList @('"' + $assembly + '"') -WorkingDirectory $workspace `
             -WindowStyle Hidden -PassThru `
@@ -28,29 +32,21 @@ try {
             -RedirectStandardError (Join-Path $logDirectory "$name.error.log")
     }
 
-    # Backend first so its STATE is online before the gateway births.
-    $backend = Start-Service 'Application.Api'
-    $services += $backend
-    $apiUrl = if ($settings.Urls) { $settings.Urls.Split(';')[0].TrimEnd('/') } else { 'http://localhost:5114' }
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    while ($true) {
-        if ($backend.HasExited) { throw 'Backend stopped. Check logs/.' }
-        try {
-            Invoke-WebRequest -Uri ($apiUrl + '/') -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop | Out-Null
-            break
-        } catch {
-        }
-        if ([DateTime]::UtcNow -gt $deadline) { throw 'Backend did not become ready. Check logs/.' }
-        Start-Sleep -Milliseconds 200
-    }
-    $services += Start-Service 'Device.Gateway'
+    $publisher = Start-Service 'EdgeGateway.BrokerMqtt'
+    $services += $publisher
+    $gateway = Start-Service 'EdgeGateway.DataAcquisition'
+    $services += $gateway
     # The edge broker only keeps readings for the gateway once its session exists, so devices start after it.
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    while (-not (Select-String -LiteralPath (Join-Path $logDirectory 'Device.Gateway.log') -Pattern '^Intake subscribed' -Quiet)) {
+    $gatewayLog = Join-Path $logDirectory 'EdgeGateway.DataAcquisition.log'
+    while (-not ((Test-Path -LiteralPath $gatewayLog) -and
+        (Select-String -LiteralPath $gatewayLog -Pattern '^Intake subscribed' -Quiet))) {
+        if ($gateway.HasExited -or $publisher.HasExited) { throw 'Gateway or EdgeGateway.BrokerMqtt stopped. Check logs/.' }
         if ([DateTime]::UtcNow -gt $deadline) { throw 'Gateway intake did not subscribe. Check logs/.' }
         Start-Sleep -Milliseconds 200
     }
-    Write-Output "Application started. Dashboard and API: $apiUrl | service logs: logs/"
+    if ($publisher.HasExited) { throw 'EdgeGateway.BrokerMqtt stopped. Check logs/.' }
+    Write-Output 'Gateway intake and EdgeGateway.BrokerMqtt started without the backend. Logs: logs/'
     Write-Output 'Running the fridge simulator. Press Ctrl+C to stop everything.'
     dotnet (Join-Path $workspace 'src/Device.Simulator/bin/Debug/net8.0/Device.Simulator.dll') |
         Tee-Object -FilePath (Join-Path $logDirectory 'Device.Simulator.log')

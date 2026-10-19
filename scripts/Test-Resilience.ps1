@@ -11,7 +11,7 @@ $settings = Get-Content -LiteralPath (Join-Path $workspace 'appsettings.json') -
 $apiUrl = if ($settings.Urls) { $settings.Urls.Split(';')[0].TrimEnd('/') } else { 'http://localhost:5114' }
 $arguments = @{
     'Application.Api' = @("--Storage:DatabasePath=$run/backend.db")
-    'Device.Gateway' = @("--Gateway:DatabasePath=$run/outbox.db")
+    'EdgeGateway.BrokerMqtt' = @("--Gateway:DatabasePath=$run/outbox.db")
     'Device.Simulator' = @('--Simulator:ReadingIntervalSeconds=2', "--Simulator:StateDirectory=$run/devices")
 }
 $processes = @{}
@@ -19,7 +19,8 @@ $launches = @{}
 
 function Start-Component([string]$name) {
     $launches[$name] = 1 + [int]$launches[$name]
-    $assembly = Join-Path $workspace "src/$name/bin/Debug/net8.0/$name.dll"
+    $sourceRoot = if ($name.StartsWith('EdgeGateway.')) { 'src/EdgeGateway' } else { 'src' }
+    $assembly = Join-Path $workspace "$sourceRoot/$name/bin/Debug/net8.0/$name.dll"
     $processes[$name] = Start-Process -FilePath $dotnet -ArgumentList (@("`"$assembly`"") + $arguments[$name]) `
         -WorkingDirectory $workspace -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput "$run/$name.$($launches[$name]).log" -RedirectStandardError "$run/$name.$($launches[$name]).error.log"
@@ -31,7 +32,7 @@ function Stop-Component([string]$name) {
 function Wait-IntakeSubscribed {
     # The edge broker only keeps readings for the gateway once its session exists, so devices start after it.
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    while (-not (Select-String -Path "$run/Device.Gateway.$($launches['Device.Gateway']).log" -Pattern '^Intake subscribed' -Quiet)) {
+    while (-not (Select-String -Path "$run/EdgeGateway.DataAcquisition.$($launches['EdgeGateway.DataAcquisition']).log" -Pattern '^Intake subscribed' -Quiet)) {
         if ([DateTime]::UtcNow -gt $deadline) { throw 'Gateway intake did not subscribe.' }
         Start-Sleep -Milliseconds 200
     }
@@ -53,15 +54,16 @@ try {
 
     Start-Component 'Application.Api'
     Start-Sleep -Seconds 5
-    Start-Component 'Device.Gateway'
+    Start-Component 'EdgeGateway.BrokerMqtt'
+    Start-Component 'EdgeGateway.DataAcquisition'
     Wait-IntakeSubscribed
     Start-Component 'Device.Simulator'
     Step 'All components running.'
 
     Stop-Component 'Application.Api'; Step 'Backend killed: gateway should end its session and buffer.'
     Start-Component 'Application.Api'; Step 'Backend restarted: buffered readings replay as historical.'
-    Stop-Component 'Device.Gateway'; Step 'Gateway killed: edge broker should hold readings.'
-    Start-Component 'Device.Gateway'; Step 'Gateway restarted: outbox and edge session drain.'
+    Stop-Component 'EdgeGateway.BrokerMqtt'; Step 'Gateway killed: edge broker should hold readings.'
+    Start-Component 'EdgeGateway.BrokerMqtt'; Step 'Gateway restarted: outbox and edge session drain.'
     Invoke-Docker restart dotnet-mqtt-demo-mosquitto-1; Step 'Upstream broker restarted.'
     Invoke-Docker restart dotnet-mqtt-demo-edge-mosquitto-1; Step 'Edge broker restarted: simulator queues and resends.'
     Stop-Component 'Device.Simulator'; Step 'Simulator killed: expect DDEATH.'

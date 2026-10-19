@@ -2,7 +2,7 @@ using System.Text.Json;
 using IoT.Contracts;
 using Microsoft.Data.Sqlite;
 
-namespace Device.Gateway.Storage;
+namespace EdgeGateway.BrokerMqtt.Storage;
 
 public sealed record OutboxRow(long Id, string Kind, string DeviceId, DeviceReading? Reading, DateTimeOffset CreatedAt);
 

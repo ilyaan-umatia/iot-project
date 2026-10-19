@@ -1,7 +1,7 @@
-using Device.Gateway.Configuration;
-using Device.Gateway.Connection;
-using Device.Gateway.Intake;
-using Device.Gateway.Storage;
+using EdgeGateway.BrokerMqtt.Configuration;
+using EdgeGateway.BrokerMqtt.Connection;
+using EdgeGateway.BrokerMqtt.Intake;
+using EdgeGateway.BrokerMqtt.Storage;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 
@@ -19,7 +19,7 @@ try
         ?? throw new InvalidOperationException("Could not read appsettings.json.");
     using var outbox = new Outbox(settings.Gateway.DatabasePath);
     using var connection = new MqttConnection(settings.Mqtt, settings.Sparkplug);
-    using var intake = new DeviceSubscriber(settings.Edge, settings.Mqtt.ClientId + "-intake", outbox);
+    var intake = new AcquisitionReceiver(settings.NetMq, outbox);
     var runner = new GatewayRunner(connection, outbox, settings);
     Console.WriteLine($"Outbox: {settings.Gateway.DatabasePath} ({outbox.CountUnsent()} unsent). Type stop to exit.");
     var input = Task.Run(() =>
@@ -40,9 +40,9 @@ try
         "status.json"), stop.Token);
     try
     {
-        if (await Task.WhenAny(input, running, receiving) == input)
-            stop.Cancel();
-        await running;
+        var completed = await Task.WhenAny(input, running, receiving);
+        stop.Cancel();
+        await completed;
     }
     catch (OperationCanceledException) when (stop.IsCancellationRequested)
     {
@@ -51,10 +51,16 @@ try
     finally
     {
         stop.Cancel();
-        await receiving;
-        await reporting;
-        using var disconnectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await connection.DisconnectAsync(disconnectTimeout.Token);
+        try
+        {
+            try { await Task.WhenAll(running, receiving, reporting); }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        }
+        finally
+        {
+            using var disconnectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await connection.DisconnectAsync(disconnectTimeout.Token);
+        }
     }
     Console.WriteLine("Disconnected.");
 
@@ -68,7 +74,7 @@ try
                 var json = JsonSerializer.Serialize(new
                 {
                     updatedAt = DateTimeOffset.UtcNow, upstream = connection.State.ToString(),
-                    hostOnline = runner.HostOnline, intakeConnected = intake.IsConnected,
+                    hostOnline = runner.HostOnline,
                     unsent = outbox.CountUnsent(), bdSeq = connection.BirthDeathSequence,
                     lastPublished = runner.LastPublished
                 });
@@ -86,3 +92,4 @@ catch (Exception error)
     Console.Error.WriteLine($"Gateway error: {error.Message}");
     Environment.ExitCode = 1;
 }
+finally { NetMQ.NetMQConfig.Cleanup(); }

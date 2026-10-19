@@ -12,7 +12,8 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration.CommandLine" Version="8.0.0" />
-    <ProjectReference Include="../IoT.Contracts/IoT.Contracts.csproj" />
-    <None Include="../../broker/certs/broker.crt" Link="certs/broker.crt" CopyToOutputDirectory="PreserveNewest" />
+    <PackageReference Include="NetMQ" Version="4.0.2.2" />
+    <ProjectReference Include="../../IoT.Contracts/IoT.Contracts.csproj" />
+    <None Include="../../../broker/certs/broker.crt" Link="certs/broker.crt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

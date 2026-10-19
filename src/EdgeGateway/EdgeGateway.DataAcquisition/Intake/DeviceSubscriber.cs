@@ -1,17 +1,17 @@
 using System.Buffers;
 using System.Text;
 using System.Text.Json;
-using Device.Gateway.Configuration;
-using Device.Gateway.Storage;
+using EdgeGateway.DataAcquisition.Configuration;
+
 using IoT.Contracts;
 using MQTTnet;
 using MQTTnet.Formatter;
 using MQTTnet.Protocol;
 
-namespace Device.Gateway.Intake;
+namespace EdgeGateway.DataAcquisition.Intake;
 
 // Receives device messages from the edge broker and acknowledges each one only after the outbox commits it.
-public sealed class DeviceSubscriber(EdgeBrokerSettings settings, string clientId, Outbox outbox) : IDisposable
+public sealed class DeviceSubscriber(EdgeBrokerSettings settings, string clientId, BrokerSender sender) : IDisposable
 {
     private readonly IMqttClient _client = new MqttClientFactory().CreateMqttClient();
     public bool IsConnected => _client.IsConnected;
@@ -28,7 +28,7 @@ public sealed class DeviceSubscriber(EdgeBrokerSettings settings, string clientI
             .WithTimeout(TimeSpan.FromSeconds(settings.ConnectTimeoutSeconds))
             .WithKeepAlivePeriod(TimeSpan.FromSeconds(settings.KeepAliveSeconds))
             .Build();
-        _client.ApplicationMessageReceivedAsync += HandleAsync;
+        _client.ApplicationMessageReceivedAsync += args => HandleAsync(args, cancellationToken);
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -65,7 +65,7 @@ public sealed class DeviceSubscriber(EdgeBrokerSettings settings, string clientI
         }
     }
 
-    private async Task HandleAsync(MqttApplicationMessageReceivedEventArgs args)
+    private async Task HandleAsync(MqttApplicationMessageReceivedEventArgs args, CancellationToken cancellationToken)
     {
         args.AutoAcknowledge = false;
         var topic = args.ApplicationMessage.Topic;
@@ -80,16 +80,16 @@ public sealed class DeviceSubscriber(EdgeBrokerSettings settings, string clientI
                     ?? throw new ArgumentException("Empty reading.");
                 if (reading.DeviceId != deviceId) throw new ArgumentException("Topic and payload device differ.");
                 reading.Validate();
-                Console.WriteLine(outbox.AcceptReading(reading)
-                    ? $"Buffered {deviceId} #{reading.DeviceSeq}"
-                    : $"Ignored duplicate {deviceId} #{reading.DeviceSeq}");
+                await sender.SendAsync(new(deviceId, reading), cancellationToken);
+                Console.WriteLine($"Forwarded {deviceId} #{reading.DeviceSeq} to EdgeGateway.BrokerMqtt.");
             }
-            else if (kind == "status" && Encoding.UTF8.GetString(payload) == EdgeTopics.Offline &&
-                     outbox.AcceptDeviceOffline(deviceId))
+            else if (kind == "status" && Encoding.UTF8.GetString(payload) == EdgeTopics.Offline)
             {
+                await sender.SendAsync(new(deviceId, null), cancellationToken);
                 Console.WriteLine($"Device offline: {deviceId}");
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
         catch (Exception error) when (error is ArgumentException or JsonException)
         {
             // Invalid messages are acknowledged so they do not block the session.

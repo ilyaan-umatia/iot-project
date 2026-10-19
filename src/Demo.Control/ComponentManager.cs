@@ -15,7 +15,7 @@ public sealed record FridgeDefinition(string Id, int GpioPin, double BaseTempera
 // (each with its own MQTT connection) and two broker containers.
 public sealed partial class ComponentManager : IDisposable
 {
-    public const string Backend = "backend", Gateway = "gateway", Broker = "mosquitto", EdgeBroker = "edge-broker";
+    public const string Backend = "backend", Gateway = "gateway", Publisher = "publisher", Broker = "mosquitto", EdgeBroker = "edge-broker";
     private static readonly Dictionary<string, string> Containers = new()
     {
         [Broker] = "dotnet-mqtt-demo-mosquitto-1",
@@ -46,7 +46,8 @@ public sealed partial class ComponentManager : IDisposable
         _processes = new()
         {
             [Backend] = new("Application.Api", _workspace, logs),
-            [Gateway] = new("Device.Gateway", _workspace, logs)
+            [Gateway] = new("EdgeGateway.DataAcquisition", _workspace, logs),
+            [Publisher] = new("EdgeGateway.BrokerMqtt", _workspace, logs)
         };
         _processes[Gateway].Line += line =>
         {
@@ -79,7 +80,8 @@ public sealed partial class ComponentManager : IDisposable
         [
             .. Fridges.Select(fridge => View(fridge.Id, _controls[fridge.Id].Paused ? "running, readings paused" : null)),
             ContainerView(EdgeBroker),
-            View(Gateway, gateway is null ? null : $"upstream {gateway.Value.GetProperty("upstream").GetString()}"),
+            View(Gateway, null),
+            View(Publisher, gateway is null ? null : $"upstream {gateway.Value.GetProperty("upstream").GetString()}"),
             ContainerView(Broker),
             View(Backend, null)
         ];
@@ -106,7 +108,7 @@ public sealed partial class ComponentManager : IDisposable
         var path = Path.Combine(_state, "status.json");
         try
         {
-            if (!_processes[Gateway].Running || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromSeconds(4))
+            if (!_processes[Publisher].Running || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromSeconds(4))
                 return null;
             using var document = JsonDocument.Parse(File.ReadAllText(path));
             return document.RootElement.Clone();
@@ -191,6 +193,7 @@ public sealed partial class ComponentManager : IDisposable
         await RefreshContainersAsync();
         if (!_processes[Backend].Running) await ActAsync(Backend, "start");
         for (var attempt = 0; attempt < 60 && !await BackendReachableAsync(); attempt++) await Task.Delay(500);
+        if (!_processes[Publisher].Running) await ActAsync(Publisher, "start");
         if (!_processes[Gateway].Running)
         {
             await ActAsync(Gateway, "start");
@@ -204,6 +207,7 @@ public sealed partial class ComponentManager : IDisposable
     {
         await Task.WhenAll(Fridges.Select(fridge => ActAsync(fridge.Id, "stop")));
         await ActAsync(Gateway, "stop");
+        await ActAsync(Publisher, "stop");
         await ActAsync(Backend, "stop");
     }
 
@@ -230,7 +234,8 @@ public sealed partial class ComponentManager : IDisposable
     private IEnumerable<string> Arguments(string name)
     {
         if (name == Backend) return [$"--Storage:DatabasePath={Path.Combine(_state, "backend.db")}"];
-        if (name == Gateway) return [$"--Gateway:DatabasePath={Path.Combine(_state, "outbox.db")}"];
+        if (name == Gateway) return [];
+        if (name == Publisher) return [$"--Gateway:DatabasePath={Path.Combine(_state, "outbox.db")}"];
         var fridge = Fridges.Single(item => item.Id == name);
         return
         [

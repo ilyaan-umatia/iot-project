@@ -1,9 +1,9 @@
-namespace Device.Gateway.Configuration;
+namespace EdgeGateway.BrokerMqtt.Configuration;
 
 public sealed class GatewaySettings
 {
     public MqttSettings Mqtt { get; set; } = new();
-    public EdgeBrokerSettings Edge { get; set; } = new();
+    public IoT.Contracts.NetMqSettings NetMq { get; set; } = new();
     public SparkplugSettings Sparkplug { get; set; } = new();
     public GatewayOutboxSettings Gateway { get; set; } = new();
 }
@@ -20,15 +20,6 @@ public sealed class MqttSettings
     public int KeepAliveSeconds { get; set; } = 60;
     public int RetryDelaySeconds { get; set; } = 2;
     public int MaxRetryDelaySeconds { get; set; } = 30;
-}
-
-// Local broker that devices publish to; the gateway keeps a persistent session on it.
-public sealed class EdgeBrokerSettings
-{
-    public string Host { get; set; } = "127.0.0.1";
-    public int Port { get; set; } = 1883;
-    public int ConnectTimeoutSeconds { get; set; } = 10;
-    public int KeepAliveSeconds { get; set; } = 30;
 }
 
 public sealed class SparkplugSettings

@@ -1,7 +1,7 @@
 using IoT.Contracts;
 using Org.Eclipse.Tahu.Protobuf;
 
-namespace Device.Gateway.Sparkplug;
+namespace EdgeGateway.BrokerMqtt.Sparkplug;
 
 public static class SparkplugPayloads
 {

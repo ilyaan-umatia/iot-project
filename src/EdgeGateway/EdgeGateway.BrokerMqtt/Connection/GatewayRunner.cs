@@ -1,11 +1,11 @@
 using System.Diagnostics;
-using Device.Gateway.Configuration;
-using Device.Gateway.Sparkplug;
-using Device.Gateway.Storage;
+using EdgeGateway.BrokerMqtt.Configuration;
+using EdgeGateway.BrokerMqtt.Sparkplug;
+using EdgeGateway.BrokerMqtt.Storage;
 using Google.Protobuf;
 using MQTTnet.Protocol;
 
-namespace Device.Gateway.Connection;
+namespace EdgeGateway.BrokerMqtt.Connection;
 
 public sealed class GatewayRunner(MqttConnection connection, Outbox outbox, GatewaySettings settings)
 {

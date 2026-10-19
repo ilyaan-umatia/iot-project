@@ -2,7 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace Device.Gateway.Sparkplug;
+namespace EdgeGateway.BrokerMqtt.Sparkplug;
 
 public sealed class BirthDeathSequenceStore
 {

@@ -32,7 +32,8 @@ public sealed class ManagedProcess(string name, string workspace, string logDire
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
-            start.ArgumentList.Add(Path.Combine(workspace, "src", name, "bin", "Debug", "net8.0", name + ".dll"));
+            var sourceRoot = name.StartsWith("EdgeGateway.") ? Path.Combine(workspace, "src", "EdgeGateway") : Path.Combine(workspace, "src");
+            start.ArgumentList.Add(Path.Combine(sourceRoot, name, "bin", "Debug", "net8.0", name + ".dll"));
             foreach (var argument in arguments) start.ArgumentList.Add(argument);
             Directory.CreateDirectory(logDirectory);
             _log?.Dispose();
