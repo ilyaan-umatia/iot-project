@@ -1,5 +1,5 @@
 using Application.Api.Services;
-using EdgeGateway.BrokerMqtt.Sparkplug;
+using EdgeGateway.Gateway.Sparkplug;
 using Google.Protobuf;
 using IoT.Contracts;
 using Org.Eclipse.Tahu.Protobuf;
@@ -273,7 +273,7 @@ using (var historyStore = new TelemetryStore(":memory:"))
 var nodeBirth = new SparkplugDecoder().Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(3).ToByteArray());
 Check(nodeBirth.Metrics["Node Control/Rebirth"].Boolean == false, "NBIRTH is missing Node Control/Rebirth.");
 var readingTime = DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-var sample = new DeviceReading("fridge-01", 42, readingTime, 4.5, 65, 17, 0);
+var sample = SparkplugPayloads.FridgeReading("fridge-01", 42, readingTime, 4.5, 65, 17, 0);
 LifecycleEvent DecodeReplay(byte bdSeq, ulong seq, bool historical)
 {
     var target = new SparkplugDecoder();
@@ -306,7 +306,7 @@ var outboxPath = Path.Combine(outboxDirectory, "outbox.db");
 try
 {
     DeviceReading Reading(ulong seq) => sample with { DeviceSeq = seq };
-    using (var outbox = new EdgeGateway.BrokerMqtt.Storage.Outbox(outboxPath))
+    using (var outbox = new EdgeGateway.Gateway.Storage.Outbox(outboxPath))
     {
         Check(outbox.AcceptReading(Reading(1)) && outbox.AcceptReading(Reading(2)), "Readings were not buffered.");
         Check(!outbox.AcceptReading(Reading(2)), "Redelivered reading was buffered twice.");
@@ -319,7 +319,7 @@ try
         outbox.MarkSent(rows[1]);
         Check(outbox.GetPublishedOnlineDevices().Single().DeviceSeq == 2, "Published device state is wrong.");
     }
-    using (var reopened = new EdgeGateway.BrokerMqtt.Storage.Outbox(outboxPath))
+    using (var reopened = new EdgeGateway.Gateway.Storage.Outbox(outboxPath))
     {
         var rows = reopened.PeekUnsent(10);
         Check(rows.Length == 2 && rows[0].Kind == "DDEATH" && rows[1].Reading!.DeviceSeq == 3,
@@ -337,4 +337,4 @@ finally
     if (Directory.Exists(outboxDirectory)) Directory.Delete(outboxDirectory, recursive: true);
 }
 
-await NetMqChecks.RunAsync();
+await ModbusChecks.RunAsync();
