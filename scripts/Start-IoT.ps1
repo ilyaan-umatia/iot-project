@@ -1,3 +1,5 @@
+# Runs the edge only, up to Mosquitto: Modbus simulators, configuration service and the gateway.
+# No backend, so the gateway does not wait for a primary host. Watch the data in MQTTX / MQTT Explorer.
 param([switch]$NoBuild)
 
 $ErrorActionPreference = 'Stop'
@@ -6,50 +8,36 @@ $logDirectory = Join-Path $workspace 'logs'
 $services = @()
 Push-Location $workspace
 try {
-    if (-not (Test-Path -LiteralPath (Join-Path $workspace 'appsettings.json'))) {
-        throw 'Create root appsettings.json using the settings in README.md.'
-    }
-    $settings = Get-Content -LiteralPath (Join-Path $workspace 'appsettings.json') -Raw | ConvertFrom-Json
-    if (-not [string]::IsNullOrWhiteSpace($settings.Sparkplug.HostId)) {
-        throw 'Set Sparkplug:HostId to an empty string in appsettings.json to run without the backend.'
-    }
     if (-not $NoBuild) {
         dotnet build IoT.sln --nologo --verbosity quiet
         if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
     }
     # Through cmd so Windows PowerShell does not treat docker's progress output on stderr as an error.
-    cmd /c 'docker compose up -d --wait 2>&1'
-    if ($LASTEXITCODE -ne 0) { throw 'Broker startup failed.' }
+    cmd /c 'docker compose up -d --build --wait --remove-orphans 2>&1'
+    if ($LASTEXITCODE -ne 0) { throw 'Broker or simulator startup failed. Is Docker Desktop running?' }
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 
-    function Start-Service([string]$name) {
-        $sourceRoot = if ($name.StartsWith('EdgeGateway.')) { 'src/EdgeGateway' } else { 'src' }
-        $assembly = Join-Path $workspace "$sourceRoot/$name/bin/Debug/net8.0/$name.dll"
+    function Start-Service([string]$name, [string[]]$arguments = @()) {
+        $assembly = Join-Path $workspace "src/EdgeGateway/$name/bin/Debug/net8.0/$name.dll"
         Start-Process -FilePath (Get-Command dotnet).Source `
-            -ArgumentList @('"' + $assembly + '"') -WorkingDirectory $workspace `
+            -ArgumentList (@('"' + $assembly + '"') + $arguments) -WorkingDirectory $workspace `
             -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput (Join-Path $logDirectory "$name.log") `
             -RedirectStandardError (Join-Path $logDirectory "$name.error.log")
     }
 
-    $publisher = Start-Service 'EdgeGateway.BrokerMqtt'
-    $services += $publisher
-    $gateway = Start-Service 'EdgeGateway.DataAcquisition'
-    $services += $gateway
-    # The edge broker only keeps readings for the gateway once its session exists, so devices start after it.
+    $services += Start-Service 'EdgeGateway.Configuration'
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    $gatewayLog = Join-Path $logDirectory 'EdgeGateway.DataAcquisition.log'
-    while (-not ((Test-Path -LiteralPath $gatewayLog) -and
-        (Select-String -LiteralPath $gatewayLog -Pattern '^Intake subscribed' -Quiet))) {
-        if ($gateway.HasExited -or $publisher.HasExited) { throw 'Gateway or EdgeGateway.BrokerMqtt stopped. Check logs/.' }
-        if ([DateTime]::UtcNow -gt $deadline) { throw 'Gateway intake did not subscribe. Check logs/.' }
-        Start-Sleep -Milliseconds 200
+    while ($true) {
+        try { Invoke-WebRequest -Uri 'http://127.0.0.1:5300/health' -UseBasicParsing -TimeoutSec 1 | Out-Null; break } catch { }
+        if ([DateTime]::UtcNow -gt $deadline) { throw 'Configuration service did not start. Check logs/.' }
+        Start-Sleep -Milliseconds 300
     }
-    if ($publisher.HasExited) { throw 'EdgeGateway.BrokerMqtt stopped. Check logs/.' }
-    Write-Output 'Gateway intake and EdgeGateway.BrokerMqtt started without the backend. Logs: logs/'
-    Write-Output 'Running the fridge simulator. Press Ctrl+C to stop everything.'
-    dotnet (Join-Path $workspace 'src/Device.Simulator/bin/Debug/net8.0/Device.Simulator.dll') |
-        Tee-Object -FilePath (Join-Path $logDirectory 'Device.Simulator.log')
+    Write-Output 'Edge running: simulators :5021-5023, configuration http://127.0.0.1:5300, gateway -> Mosquitto :8883. Logs: logs/'
+    Write-Output 'The simulators start with zeroed registers; write values with a Modbus tool or use ./scripts/Start-Demo.ps1 for live fridges.'
+    Write-Output 'The gateway runs below (no backend: an empty HostId, so it publishes without waiting for one). Press Ctrl+C to stop everything.'
+    dotnet (Join-Path $workspace 'src/EdgeGateway/EdgeGateway.Gateway/bin/Debug/net8.0/EdgeGateway.Gateway.dll') '--Sparkplug:HostId=' |
+        Tee-Object -FilePath (Join-Path $logDirectory 'EdgeGateway.Gateway.log')
 }
 finally {
     foreach ($service in $services) {
