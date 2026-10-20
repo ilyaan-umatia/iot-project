@@ -16,6 +16,15 @@ public sealed class SparkplugDecoder
 
     public LifecycleEvent Decode(string topic, byte[] bytes) => Decode(topic, bytes, out _);
 
+    // A metric without a "Quality" property is good.
+    public static string QualityOf(Payload.Types.Metric metric)
+    {
+        var index = metric.Properties?.Keys.IndexOf(MetricQuality.PropertyName) ?? -1;
+        return index >= 0 && index < metric.Properties!.Values.Count
+            ? MetricQuality.FromCode((int)metric.Properties.Values[index].IntValue)
+            : MetricQuality.Good;
+    }
+
     // Out-of-sync messages (missing birth, sequence gap) are still returned so the caller can store them,
     // with needsRebirth set so the host asks the edge node to resynchronize.
     public LifecycleEvent Decode(string topic, byte[] bytes, out bool needsRebirth)
@@ -52,7 +61,10 @@ public sealed class SparkplugDecoder
                     bdSeq = metric.LongValue;
                     continue;
                 }
-                if (metric.HasDoubleValue && double.IsFinite(metric.DoubleValue))
+                var quality = QualityOf(metric);
+                if (metric.IsNull || quality != MetricQuality.Good)
+                    metrics.Add(metric.Name, new(Quality: quality == MetricQuality.Good ? MetricQuality.Bad : quality));
+                else if (metric.HasDoubleValue && double.IsFinite(metric.DoubleValue))
                     metrics.Add(metric.Name, new(Number: metric.DoubleValue));
                 else if (metric.HasIntValue) metrics.Add(metric.Name, new(Number: metric.IntValue));
                 else if (metric.HasLongValue) metrics.Add(metric.Name, new(Number: metric.LongValue));

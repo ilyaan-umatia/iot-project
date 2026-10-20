@@ -6,4 +6,19 @@ public sealed record LifecycleEvent(
     DateTimeOffset? RecordedAt, ulong? Seq, ulong? BdSeq,
     Dictionary<string, MetricValue> Metrics, bool Historical = false);
 
-public sealed record MetricValue(double? Number = null, bool? Boolean = null);
+// Quality is null for a good value. A bad or stale metric carries no value.
+public sealed record MetricValue(double? Number = null, bool? Boolean = null, string? Quality = null)
+{
+    public bool IsGood => Quality is null or MetricQuality.Good;
+}
+
+// Data quality as Sparkplug carries it: a "Quality" metric property with OPC-style codes.
+public static class MetricQuality
+{
+    public const string Good = "good", Bad = "bad", Stale = "stale";
+    public const string PropertyName = "Quality";
+
+    public static int Code(string? quality) => quality switch { Bad => 0, Stale => 500, _ => 192 };
+
+    public static string FromCode(int code) => code switch { 0 => Bad, 500 => Stale, _ => Good };
+}
