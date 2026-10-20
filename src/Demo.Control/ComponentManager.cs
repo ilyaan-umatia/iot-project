@@ -7,83 +7,70 @@ using System.Text.RegularExpressions;
 namespace Demo.Control;
 
 public sealed record ComponentView(string Name, string Kind, bool Running, string Status, string[] Actions);
-public sealed record FridgeState(bool DoorOpen, bool Spike, bool Paused);
-public sealed record FridgeView(string Id, bool Running, int GpioPin, FridgeState Controls, long LastSent);
-public sealed record FridgeDefinition(string Id, int GpioPin, double BaseTemperature);
+public sealed record FridgeView(string Id, bool Running, int Port, int GpioPin, FridgeState Controls, long LastPolled);
+public sealed record FridgeDefinition(string Id, int Port, int GpioPin, double BaseTemperature);
 
-// Starts, stops and crashes every demo component: the backend, the gateway, one simulator per fridge
-// (each with its own MQTT connection) and two broker containers.
+// Starts, stops and crashes every demo component: the configuration service and the gateway
+// as processes; the broker and one Modbus simulator per fridge as containers.
 public sealed partial class ComponentManager : IDisposable
 {
-    public const string Backend = "backend", Gateway = "gateway", Publisher = "publisher", Broker = "mosquitto", EdgeBroker = "edge-broker";
-    private static readonly Dictionary<string, string> Containers = new()
-    {
-        [Broker] = "dotnet-mqtt-demo-mosquitto-1",
-        [EdgeBroker] = "dotnet-mqtt-demo-edge-mosquitto-1"
-    };
+    public const string Configuration = "configuration", Gateway = "gateway",
+        Broker = "mosquitto";
     public static readonly FridgeDefinition[] Fridges =
     [
-        new("fridge-01", 17, 4.5), new("fridge-02", 18, 3.5), new("fridge-03", 27, 5.5)
+        new("fridge-01", 5021, 17, 4.5), new("fridge-02", 5022, 18, 3.5), new("fridge-03", 5023, 27, 5.5)
     ];
+    private static readonly Dictionary<string, string> Containers = new Dictionary<string, string>
+    {
+        [Broker] = "dotnet-mqtt-demo-mosquitto-1"
+    }.Concat(Fridges.Select(fridge => KeyValuePair.Create(fridge.Id, $"dotnet-mqtt-demo-{fridge.Id}-1")))
+     .ToDictionary(item => item.Key, item => item.Value);
 
     private readonly string _workspace;
     private readonly string _state;
     private readonly Dictionary<string, ManagedProcess> _processes;
-    private readonly Dictionary<string, string> _containerStatus = new() { [Broker] = "unknown", [EdgeBroker] = "unknown" };
-    private readonly ConcurrentDictionary<string, long> _lastSent = new();
-    private readonly ConcurrentDictionary<string, FridgeState> _controls = new();
+    private readonly Dictionary<string, string> _containerStatus = Containers.Keys.ToDictionary(name => name, _ => "unknown");
+    private readonly ConcurrentDictionary<string, long> _lastPolled = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };
-    private TaskCompletionSource _intakeSubscribed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly FridgeWorld _world;
 
-    public string BackendUrl { get; }
+    public string ConfigurationUrl { get; }
 
     public ComponentManager(IConfiguration configuration)
     {
         _workspace = FindWorkspace();
         _state = Path.Combine(_workspace, "logs", "demo", "state");
         var logs = Path.Combine(_workspace, "logs", "demo");
-        BackendUrl = (configuration["Backend:Url"] ?? "http://localhost:5114").TrimEnd('/');
+        ConfigurationUrl = (configuration["Daq:ConfigUrl"] ?? "http://127.0.0.1:5300").TrimEnd('/');
         _processes = new()
         {
-            [Backend] = new("Application.Api", _workspace, logs),
-            [Gateway] = new("EdgeGateway.DataAcquisition", _workspace, logs),
-            [Publisher] = new("EdgeGateway.BrokerMqtt", _workspace, logs)
+            [Configuration] = new("EdgeGateway.Configuration", _workspace, logs),
+            [Gateway] = new("EdgeGateway.Gateway", _workspace, logs)
         };
         _processes[Gateway].Line += line =>
         {
-            if (line.StartsWith("Intake subscribed", StringComparison.Ordinal)) _intakeSubscribed.TrySetResult();
+            if (PolledPattern().Match(line) is { Success: true } match)
+                _lastPolled[match.Groups[1].Value] = long.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
         };
-        foreach (var fridge in Fridges)
-        {
-            var process = new ManagedProcess("Device.Simulator", _workspace, logs, fridge.Id);
-            process.Line += line =>
-            {
-                if (SentPattern().Match(line) is { Success: true } match)
-                    _lastSent[fridge.Id] = long.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-            };
-            _processes[fridge.Id] = process;
-            _controls[fridge.Id] = new(false, false, false);
-        }
+        _world = new FridgeWorld(Fridges, IsContainerRunning);
     }
 
     public static bool IsFridge(string name) => Fridges.Any(fridge => fridge.Id == name);
-    public long LastSent(string fridge) => _lastSent.GetValueOrDefault(fridge);
+    public long LastPolled(string fridge) => _lastPolled.GetValueOrDefault(fridge);
     public string[] Tail(string name, int count) => _processes.TryGetValue(name, out var process) ? process.Tail(count) : [];
 
     public FridgeView[] DescribeFridges() => Fridges.Select(fridge => new FridgeView(fridge.Id,
-        _processes[fridge.Id].Running, fridge.GpioPin, _controls[fridge.Id], LastSent(fridge.Id))).ToArray();
+        IsContainerRunning(fridge.Id), fridge.Port, fridge.GpioPin, _world.State(fridge.Id), LastPolled(fridge.Id))).ToArray();
 
     public ComponentView[] Describe()
     {
         var gateway = ReadGatewayStatus();
         return
         [
-            .. Fridges.Select(fridge => View(fridge.Id, _controls[fridge.Id].Paused ? "running, readings paused" : null)),
-            ContainerView(EdgeBroker),
-            View(Gateway, null),
-            View(Publisher, gateway is null ? null : $"upstream {gateway.Value.GetProperty("upstream").GetString()}"),
-            ContainerView(Broker),
-            View(Backend, null)
+            .. Fridges.Select(fridge => ContainerView(fridge.Id)),
+            View(Configuration, null),
+            View(Gateway, gateway is null ? null : $"upstream {gateway.Value.GetProperty("upstream").GetString()}"),
+            ContainerView(Broker)
         ];
     }
 
@@ -96,19 +83,24 @@ public sealed partial class ComponentManager : IDisposable
 
     private ComponentView ContainerView(string name)
     {
+        var running = IsContainerRunning(name);
         string status;
         lock (_containerStatus) status = _containerStatus[name];
-        var running = status == "running";
         return new(name, "container", running, status, running ? ["restart", "stop", "crash"] : ["start"]);
     }
 
-    // The gateway writes this snapshot every second; an old file means the gateway is not running.
+    private bool IsContainerRunning(string name)
+    {
+        lock (_containerStatus) return _containerStatus.GetValueOrDefault(name) == "running";
+    }
+
+    // The gateway writes this snapshot every second; an old file means it is not running.
     public JsonElement? ReadGatewayStatus()
     {
         var path = Path.Combine(_state, "status.json");
         try
         {
-            if (!_processes[Publisher].Running || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromSeconds(4))
+            if (!_processes[Gateway].Running || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromSeconds(4))
                 return null;
             using var document = JsonDocument.Parse(File.ReadAllText(path));
             return document.RootElement.Clone();
@@ -116,9 +108,11 @@ public sealed partial class ComponentManager : IDisposable
         catch (Exception error) when (error is IOException or JsonException) { return null; }
     }
 
-    public async Task<bool> BackendReachableAsync()
+    public Task<bool> ConfigurationReachableAsync() => ReachableAsync(ConfigurationUrl + "/health");
+
+    private async Task<bool> ReachableAsync(string url)
     {
-        try { return (await _http.GetAsync(BackendUrl + "/health")).IsSuccessStatusCode; }
+        try { return (await _http.GetAsync(url)).IsSuccessStatusCode; }
         catch (Exception error) when (error is HttpRequestException or TaskCanceledException) { return false; }
     }
 
@@ -132,6 +126,8 @@ public sealed partial class ComponentManager : IDisposable
                 _ => throw new ArgumentException($"Unknown action {action}.")
             };
             var (code, output) = await RunAsync("docker", [command, container]);
+            // A restarted simulator comes back with zeroed registers, like a power-cycled device.
+            if (IsFridge(name) && action is "start" or "restart") _world.Reset(name);
             await RefreshContainersAsync();
             return code == 0 ? $"{name}: {action} done." : throw new InvalidOperationException(output.Trim());
         }
@@ -139,13 +135,11 @@ public sealed partial class ComponentManager : IDisposable
         switch (action)
         {
             case "start":
-                if (name == Gateway) _intakeSubscribed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-                if (IsFridge(name)) _controls[name] = new(false, false, false);
                 process.Start(Arguments(name));
                 break;
             case "stop":
-                // The backend has no stop command; ending it closes its connection and the broker publishes its Will.
-                await process.StopAsync(acceptsStopCommand: name != Backend);
+                // The configuration service has no stop command; ending it closes its connections.
+                await process.StopAsync(acceptsStopCommand: name is Gateway);
                 break;
             case "crash":
                 process.Crash();
@@ -159,66 +153,48 @@ public sealed partial class ComponentManager : IDisposable
     public string SendFridgeCommand(string fridge, string command)
     {
         if (!IsFridge(fridge)) throw new ArgumentException($"Unknown fridge {fridge}.");
-        var text = command switch
-        {
-            "door-open" => "door open", "door-close" => "door close", "spike-on" => "spike on",
-            "spike-off" => "spike off", "pause" => "pause", "resume" => "resume",
-            _ => throw new ArgumentException($"Unknown fridge command {command}.")
-        };
-        if (!_processes[fridge].Running) throw new InvalidOperationException($"Start {fridge} first.");
-        _processes[fridge].Send(text);
-        _controls.AddOrUpdate(fridge, _ => new(false, false, false), (_, current) => command switch
-        {
-            "door-open" => current with { DoorOpen = true },
-            "door-close" => current with { DoorOpen = false },
-            "spike-on" => current with { Spike = true },
-            "spike-off" => current with { Spike = false },
-            "pause" => current with { Paused = true },
-            _ => current with { Paused = false }
-        });
-        return $"{fridge}: {text}";
+        if (!IsContainerRunning(fridge)) throw new InvalidOperationException($"Start {fridge} first.");
+        return _world.Apply(fridge, command);
     }
 
     public void SendToRunningFridges(string command)
     {
         foreach (var fridge in Fridges)
-            if (_processes[fridge.Id].Running) SendFridgeCommand(fridge.Id, command);
+            if (IsContainerRunning(fridge.Id)) _world.Apply(fridge.Id, command);
     }
 
-    // Start in dependency order: the backend's STATE first, and the gateway's edge session before any device publishes.
+    // Dependency order: devices and broker, the device registry, then the gateway,
+    // which reads its device list from the registry.
     public async Task StartAllAsync()
     {
-        var (code, output) = await RunAsync("docker", ["compose", "up", "-d", "--wait"]);
+        var (code, output) = await RunAsync("docker", ["compose", "up", "-d", "--build", "--wait", "--remove-orphans"]);
         if (code != 0) throw new InvalidOperationException(output.Trim());
         await RefreshContainersAsync();
-        if (!_processes[Backend].Running) await ActAsync(Backend, "start");
-        for (var attempt = 0; attempt < 60 && !await BackendReachableAsync(); attempt++) await Task.Delay(500);
-        if (!_processes[Publisher].Running) await ActAsync(Publisher, "start");
-        if (!_processes[Gateway].Running)
-        {
-            await ActAsync(Gateway, "start");
-            await _intakeSubscribed.Task.WaitAsync(TimeSpan.FromSeconds(30));
-        }
-        foreach (var fridge in Fridges)
-            if (!_processes[fridge.Id].Running) await ActAsync(fridge.Id, "start");
+        if (!_processes[Configuration].Running) await ActAsync(Configuration, "start");
+        await WaitUntilAsync(ConfigurationReachableAsync);
+        if (!_processes[Gateway].Running) await ActAsync(Gateway, "start");
+    }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> ready)
+    {
+        for (var attempt = 0; attempt < 60 && !await ready(); attempt++) await Task.Delay(500);
     }
 
     public async Task StopAllAsync()
     {
-        await Task.WhenAll(Fridges.Select(fridge => ActAsync(fridge.Id, "stop")));
         await ActAsync(Gateway, "stop");
-        await ActAsync(Publisher, "stop");
-        await ActAsync(Backend, "stop");
+        await ActAsync(Configuration, "stop");
     }
 
-    // Fresh brokers and empty state, so the demo starts at reading #1 with nothing queued.
+    // Fresh broker, simulators and state, so the demo starts at reading #1 with nothing queued.
     public async Task ResetAsync()
     {
         foreach (var process in _processes.Values) process.Crash();
-        var (code, output) = await RunAsync("docker", ["compose", "down", "-v"]);
+        var (code, output) = await RunAsync("docker", ["compose", "down", "-v", "--remove-orphans"]);
         if (code != 0) throw new InvalidOperationException(output.Trim());
         if (Directory.Exists(_state)) Directory.Delete(_state, recursive: true);
-        _lastSent.Clear();
+        _lastPolled.Clear();
+        foreach (var fridge in Fridges) _world.Reset(fridge.Id);
         await StartAllAsync();
     }
 
@@ -231,19 +207,13 @@ public sealed partial class ComponentManager : IDisposable
         }
     }
 
-    private IEnumerable<string> Arguments(string name)
+    private IEnumerable<string> Arguments(string name) => name switch
     {
-        if (name == Backend) return [$"--Storage:DatabasePath={Path.Combine(_state, "backend.db")}"];
-        if (name == Gateway) return [];
-        if (name == Publisher) return [$"--Gateway:DatabasePath={Path.Combine(_state, "outbox.db")}"];
-        var fridge = Fridges.Single(item => item.Id == name);
-        return
-        [
-            $"--Simulator:DeviceId={fridge.Id}", $"--Simulator:GpioPin={fridge.GpioPin}",
-            $"--Simulator:BaseTemperature={fridge.BaseTemperature.ToString(CultureInfo.InvariantCulture)}",
-            "--Simulator:ReadingIntervalSeconds=3", $"--Simulator:StateDirectory={Path.Combine(_state, "devices")}"
-        ];
-    }
+        Configuration => [$"--Configuration:DatabasePath={Path.Combine(_state, "configuration.db")}"],
+        // No backend in this flow: an empty HostId makes the gateway publish without waiting for a primary host.
+        _ => [$"--Gateway:DatabasePath={Path.Combine(_state, "outbox.db")}", "--Sparkplug:HostId=",
+            $"--Daq:StateDirectory={Path.Combine(_state, "daq")}", $"--Daq:ConfigUrl={ConfigurationUrl}"]
+    };
 
     private async Task<(int Code, string Output)> RunAsync(string file, IEnumerable<string> arguments)
     {
@@ -267,12 +237,13 @@ public sealed partial class ComponentManager : IDisposable
         throw new InvalidOperationException("Run the demo console from inside the project folder.");
     }
 
-    [GeneratedRegex(@"^Sent #(\d+):")]
-    private static partial Regex SentPattern();
+    [GeneratedRegex(@"^Polled (\S+) #(\d+):")]
+    private static partial Regex PolledPattern();
 
     public void Dispose()
     {
         foreach (var process in _processes.Values) process.Crash();
+        _world.Dispose();
         _http.Dispose();
     }
 }

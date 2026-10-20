@@ -14,11 +14,12 @@ namespace Demo.Control;
 public sealed record WireMessage(long Id, DateTimeOffset At, string Topic, string Type, string Summary,
     long? Seq, bool Historical, bool Retained);
 
-// Read-only observer on both brokers, so the page can show messages as they travel. Not part of the data path.
-public sealed class WireMonitor(IConfiguration configuration, ILogger<WireMonitor> logger) : BackgroundService
+// The console's Sparkplug consumer on Mosquitto, alongside MQTTX. It uses a persistent session with QoS 1,
+// so the broker keeps its messages while it is disconnected, and feeds both the message feed and the view.
+public sealed class WireMonitor(IConfiguration configuration, SparkplugView view, ILogger<WireMonitor> logger) : BackgroundService
 {
-    private readonly Dictionary<string, LinkedList<WireMessage>> _messages = new() { ["upstream"] = new(), ["edge"] = new() };
-    private readonly Dictionary<string, bool> _connected = new() { ["upstream"] = false, ["edge"] = false };
+    private readonly Dictionary<string, LinkedList<WireMessage>> _messages = new() { ["upstream"] = new() };
+    private readonly Dictionary<string, bool> _connected = new() { ["upstream"] = false };
     private long _nextId;
 
     public WireMessage[] Recent(string broker, int count = 120)
@@ -34,13 +35,10 @@ public sealed class WireMonitor(IConfiguration configuration, ILogger<WireMonito
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var mqtt = configuration.GetSection("Mqtt");
-        var edge = configuration.GetSection("Edge");
         var useTls = mqtt.GetValue("UseTls", true);
         var certificatePath = Path.Combine(AppContext.BaseDirectory, mqtt["BrokerCertificatePath"] ?? "certs/broker.crt");
-        return Task.WhenAll(
-            WatchAsync("upstream", mqtt["Host"] ?? "127.0.0.1", mqtt.GetValue("Port", 8883),
-                useTls && File.Exists(certificatePath) ? certificatePath : null, "spBv1.0/#", stoppingToken),
-            WatchAsync("edge", edge["Host"] ?? "127.0.0.1", edge.GetValue("Port", 1883), null, "edge/#", stoppingToken));
+        return WatchAsync("upstream", mqtt["Host"] ?? "127.0.0.1", mqtt.GetValue("Port", 8883),
+            useTls && File.Exists(certificatePath) ? certificatePath : null, "spBv1.0/#", stoppingToken);
     }
 
     private async Task WatchAsync(string broker, string host, int port, string? certificatePath, string filter,
@@ -50,9 +48,9 @@ public sealed class WireMonitor(IConfiguration configuration, ILogger<WireMonito
         using var certificate = certificatePath is null ? null : X509Certificate2.CreateFromPem(File.ReadAllText(certificatePath));
         var builder = new MqttClientOptionsBuilder()
             .WithTcpServer(host, port)
-            .WithClientId($"demo-monitor-{broker}-{Guid.NewGuid():N}"[..32])
+            .WithClientId("demo-console-monitor")
             .WithProtocolVersion(MqttProtocolVersion.V311)
-            .WithCleanSession()
+            .WithCleanSession(false)
             .WithKeepAlivePeriod(TimeSpan.FromSeconds(10));
         if (certificate is not null)
             builder.WithTlsOptions(new MqttClientTlsOptionsBuilder()
@@ -72,7 +70,7 @@ public sealed class WireMonitor(IConfiguration configuration, ILogger<WireMonito
                 {
                     await client.ConnectAsync(options, stoppingToken);
                     await client.SubscribeAsync(new MqttClientFactory().CreateSubscribeOptionsBuilder()
-                        .WithTopicFilter(filter, MqttQualityOfServiceLevel.AtMostOnce).Build(), stoppingToken);
+                        .WithTopicFilter(filter, MqttQualityOfServiceLevel.AtLeastOnce).Build(), stoppingToken);
                 }
                 lock (_messages) _connected[broker] = true;
                 await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
@@ -95,18 +93,7 @@ public sealed class WireMonitor(IConfiguration configuration, ILogger<WireMonito
         var historical = false;
         try
         {
-            if (broker == "edge")
-            {
-                var kind = topic.Split('/').LastOrDefault() ?? "";
-                type = kind == "data" ? "reading" : kind;
-                if (kind == "data" && JsonSerializer.Deserialize<DeviceReading>(payload, EdgeTopics.Json) is { } reading)
-                {
-                    summary = $"{reading.DeviceId} #{reading.DeviceSeq} · {reading.Temperature} °C · {reading.Humidity}% · door {(reading.GpioValue == 1 ? "open" : "closed")}";
-                    seq = (long)reading.DeviceSeq;
-                }
-                else summary = $"{topic.Split('/').ElementAtOrDefault(1)} {Encoding.UTF8.GetString(payload)}";
-            }
-            else if (topic.StartsWith("spBv1.0/STATE/", StringComparison.Ordinal))
+            if (topic.StartsWith("spBv1.0/STATE/", StringComparison.Ordinal))
             {
                 type = "STATE";
                 summary = Encoding.UTF8.GetString(payload);
@@ -115,6 +102,7 @@ public sealed class WireMonitor(IConfiguration configuration, ILogger<WireMonito
             {
                 type = topic.Split('/') is { Length: >= 3 } parts ? parts[2] : "?";
                 var decoded = Payload.Parser.ParseFrom(payload);
+                view.Apply(topic, decoded);
                 if (decoded.HasSeq) seq = (long)decoded.Seq;
                 historical = decoded.Metrics.Any(metric => metric.IsHistorical);
                 summary = string.Join(" · ", decoded.Metrics.Select(metric => $"{metric.Name}={Value(metric)}"));
@@ -137,7 +125,9 @@ public sealed class WireMonitor(IConfiguration configuration, ILogger<WireMonito
     }
 
     private static string Value(Payload.Types.Metric metric) =>
-        metric.HasDoubleValue ? metric.DoubleValue.ToString(CultureInfo.InvariantCulture)
+        metric.IsNull || SparkplugDecoder.QualityOf(metric) != MetricQuality.Good
+            ? $"null ({SparkplugDecoder.QualityOf(metric) switch { MetricQuality.Good => MetricQuality.Bad, var quality => quality }})"
+        : metric.HasDoubleValue ? metric.DoubleValue.ToString(CultureInfo.InvariantCulture)
         : metric.HasBooleanValue ? metric.BooleanValue.ToString().ToLowerInvariant()
         : metric.HasLongValue ? metric.LongValue.ToString(CultureInfo.InvariantCulture)
         : metric.HasIntValue ? metric.IntValue.ToString(CultureInfo.InvariantCulture)

@@ -56,7 +56,7 @@
 
   /* Pipeline: three fridges, each with its own link into the edge broker */
   .pipeline { display: grid; align-items: center;
-    grid-template-columns: minmax(0,1.5fr) minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr); }
+    grid-template-columns: minmax(0,1.5fr) minmax(0,1.2fr) auto minmax(0,1fr) auto minmax(0,1fr); }
   .fridges { display: grid; gap: 6px; }
   .frow { display: grid; grid-template-columns: minmax(0, 1fr) 64px; align-items: center; }
   .node { border: 1.5px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel);
@@ -80,8 +80,15 @@
     border-radius: 3px; background: var(--dotc, var(--accent)); animation: travel .9s linear; }
   .link.cut { background: repeating-linear-gradient(90deg, var(--bad) 0 6px, transparent 6px 10px); }
   @keyframes travel { to { left: 100%; } }
-  .edge-col { align-self: stretch; display: flex; }
+  .edge-col { align-self: stretch; display: flex; flex-direction: column; gap: 6px; }
   .edge-col .node { flex: 1; }
+  /* Vertical link: the gateway pulls its device list from the configuration service. */
+  .vlink { display: flex; align-items: center; gap: 8px; padding: 2px 0 2px 18px; }
+  .vlink .bar { width: 2px; height: 26px; background: var(--line); position: relative; overflow: hidden; flex: none; }
+  .vlink .bar.flow::after { content: ""; position: absolute; left: -2px; top: -10px; width: 6px; height: 10px; border-radius: 3px; background: var(--accent); animation: down .9s linear; }
+  .vlink .bar.cut { background: repeating-linear-gradient(180deg, var(--bad) 0 5px, transparent 5px 9px); }
+  .vlink small { color: var(--muted); font-size: 11px; }
+  @keyframes down { to { top: 100%; } }
 
   .row2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1.3fr) minmax(0,1.2fr); gap: 14px; margin-top: 14px; }
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
@@ -176,16 +183,16 @@
 <main>
   <header>
     <h1>IoT Demo Console</h1>
-    <span class="sub">Sparkplug B edge pipeline · three fridges, one gateway</span>
+    <span class="sub">Modbus devices → gateway (polling, SQLite outbox, Sparkplug B) → Mosquitto</span>
     <span class="spacer"></span>
-    <span class="pill" id="backend-pill"><span class="dot"></span><span>Connecting</span></span>
+    <span class="pill" id="monitor-pill"><span class="dot"></span><span>Connecting</span></span>
     <button class="btn primary" data-demo="start-all">Start all</button>
     <button class="btn" data-demo="stop-all">Stop all</button>
     <button class="btn danger" data-demo="reset" title="Wipes broker data and demo state, then starts everything">Reset demo</button>
   </header>
 
   <section class="panel">
-    <h2>Data path <span class="note sub">Stop = clean shutdown · Crash = kill without warning · each fridge has its own MQTT connection</span></h2>
+    <h2>Data path <span class="note sub">Stop = clean shutdown · Crash = kill without warning · fridges are pymodbus simulators polled over Modbus TCP</span></h2>
     <div class="pipeline" id="pipeline"></div>
   </section>
 
@@ -193,13 +200,13 @@
     <div class="panel">
       <h2>Gateway buffer (SQLite outbox)</h2>
       <div class="big" id="g-unsent">—</div>
-      <div class="hint">messages saved on disk, waiting for the broker's acknowledgement</div>
+      <div class="hint">readings saved on disk as soon as they are polled, waiting for the broker's acknowledgement</div>
       <dl class="kv" style="margin-top:12px" id="g-kv"></dl>
     </div>
     <div class="panel">
-      <h2>Fridges (physical world)</h2>
+      <h2>Fridges (physical world, written into each simulator over Modbus)</h2>
       <div class="ctable" id="controls"></div>
-      <div class="hint">Door: GPIO input, temperature rises while open · Fault: temperature climbs past the 8 °C alarm · Pause: sensor stays connected but silent</div>
+      <div class="hint">Door: GPIO input, temperature rises while open · Fault: temperature climbs past the 8 °C alarm · Pause: register values freeze</div>
     </div>
     <div class="panel">
       <h2>Resilience test <button class="btn sm primary" id="run-test" style="margin-left:auto">Run</button></h2>
@@ -209,7 +216,7 @@
   </section>
 
   <section class="stats" id="stats">
-    <div class="panel stat" id="s-readings"><div class="value">—</div><div class="label">Readings stored (all fridges)</div></div>
+    <div class="panel stat" id="s-readings"><div class="value">—</div><div class="label">Readings on Mosquitto (all fridges)</div></div>
     <div class="panel stat" id="s-missing"><div class="value">—</div><div class="label">Missing readings</div></div>
     <div class="panel stat" id="s-duplicates"><div class="value">—</div><div class="label">Duplicate readings</div></div>
     <div class="panel stat" id="s-historical"><div class="value">—</div><div class="label">Replayed as historical</div></div>
@@ -219,7 +226,7 @@
   <section class="grid">
     <div class="stack">
       <div class="panel" id="device-panel">
-        <h2>Devices (as the backend sees them)</h2>
+        <h2>Devices (as a Sparkplug subscriber on Mosquitto sees them)</h2>
         <div class="devices" id="devices"><div class="empty">No device has been born yet.</div></div>
       </div>
       <div class="panel" id="chart-panel">
@@ -230,22 +237,21 @@
       <div class="panel">
         <h2>Sparkplug message types</h2>
         <div class="flows">
-          <div><b class="badge b-STATE">STATE</b><span>Backend (Primary Host) online/offline. Retained, with a Will. The gateway only publishes while it is online.</span></div>
+          <div><b class="badge b-STATE">STATE</b><span>A Primary Host's online/offline. None in this flow, so the gateway does not wait for one.</span></div>
           <div><b class="badge b-NBIRTH">NBIRTH</b><span>Gateway session start: seq 0, bdSeq, Node Control/Rebirth.</span></div>
           <div><b class="badge b-DBIRTH">DBIRTH</b><span>A device introduced with all its metrics; one per fridge.</span></div>
           <div><b class="badge b-DDATA">DDATA</b><span>A reading. seq 0–255 (shared across the gateway) detects gaps; DeviceSeq removes duplicates.</span></div>
           <div><b class="badge b-NDATA">NDATA</b><span>Gateway heartbeat (uptime).</span></div>
-          <div><b class="badge b-DDEATH">DDEATH</b><span>One device lost: its MQTT Will on the edge broker fired. The others are unaffected.</span></div>
+          <div><b class="badge b-DDEATH">DDEATH</b><span>One device lost: data acquisition failed to poll it 3 times in a row, or it was removed from the registry. The others are unaffected.</span></div>
           <div><b class="badge b-NDEATH">NDEATH</b><span>Gateway session ended, which takes all its devices offline with it.</span></div>
-          <div><b class="badge b-NCMD">NCMD</b><span>Backend asks for a Rebirth when it is out of sync.</span></div>
+          <div><b class="badge b-NCMD">NCMD</b><span>A host application asks for a Rebirth when it is out of sync (none in this flow).</span></div>
         </div>
       </div>
     </div>
     <div class="panel">
       <div class="tabs" id="tabs">
-        <button class="tab on" data-tab="stored">Stored by backend</button>
-        <button class="tab" data-tab="upstream">On the wire: Mosquitto</button>
-        <button class="tab" data-tab="edge">On the wire: edge broker</button>
+        <button class="tab on" data-tab="upstream">On the wire: Mosquitto</button>
+        <button class="tab" data-tab="registry">Device registry</button>
         <button class="tab" data-tab="logs">Logs</button>
       </div>
       <div class="tabnote" id="tabnote"></div>
@@ -261,20 +267,21 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const time = iso => iso ? new Date(iso).toLocaleTimeString([], { hour12: false }) : "—";
 const num = (m, k) => m?.[k]?.number;
 const CORE = {
-  "edge-broker": { label: "Edge broker", role: "Mosquitto :1883 · one session per device" },
-  "gateway": { label: "Gateway", role: "SQLite outbox · Sparkplug edge node" },
+  "configuration": { label: "Configuration", role: "Device registry · REST :5300" },
+  "gateway": { label: "Gateway", role: "Modbus polling · SQLite outbox · Sparkplug edge node" },
   "mosquitto": { label: "Mosquitto", role: "Broker :8883 · TLS" },
-  "backend": { label: "Backend", role: "Primary Host · SQLite" }
+  "subscribers": { label: "Subscribers", role: "MQTTX · this console (persistent session)" }
 };
 const TAB_NOTES = {
-  stored: "Messages the backend received and saved, newest first. This is what reaches the application.",
   upstream: "Every Sparkplug message passing through Mosquitto, decoded live, including STATE and NCMD.",
-  edge: "Raw device traffic on the edge broker, before the gateway turns it into Sparkplug.",
+  registry: "Devices in the configuration service. Data acquisition polls every enabled device; changes apply within about 10 seconds.",
   logs: "Console output of the selected component."
 };
-let fridgeIds = [], tab = "stored", logName = "gateway", state = null, backend = null;
-let lastEventId = 0, lastWireId = 0, lastHistorical = null, busy = false;
-const color = id => `var(--c${fridgeIds.indexOf(id) % 3 + 1})`;
+let fridgeIds = [], tab = "upstream", logName = "gateway", state = null, view = null;
+let lastWireId = 0, lastHistorical = null, busy = false;
+// Simulated fridges first, then any other device the registry added, so colors stay stable.
+let deviceIds = [];
+const color = id => `var(--c${Math.max(0, deviceIds.indexOf(id)) % 3 + 1})`;
 
 function toast(message, error) {
   const t = $("toast");
@@ -327,21 +334,21 @@ function buildPipeline() {
             <span class="actions" id="a-${id}"></span></div>
           <div class="detail" id="d-${id}">—</div>
         </div>
-        <div class="linkwrap"><small>MQTT</small><div class="link" id="l-${id}" style="--dotc:${color(id)}"></div></div>
+        <div class="linkwrap"><small>Modbus</small><div class="link" id="l-${id}" style="--dotc:${color(id)}"></div></div>
       </div>`).join("")}
     </div>
-    <div class="edge-col">${core("edge-broker")}</div>
-    ${core("gateway", "ack after save")}
+    <div class="edge-col">${core("configuration")}<div class="vlink"><div class="bar" id="l-config"></div><small id="t-config">HTTP GET /config every 10 s · device list</small></div>${core("gateway")}</div>
     ${core("mosquitto", "Sparkplug B")}
-    ${core("backend", "persistent session")}`;
+    ${core("subscribers", "Sparkplug B")}`;
 }
 
 function fridgeView(id) { return state.fridges.find(f => f.id === id); }
+function up(name) { return state.components.find(c => c.name === name)?.running; }
 
 function nodeState(c, gw) {
   if (!c.running) return "bad";
   if (c.name === "gateway" && gw && (gw.upstream !== "Online" || !gw.hostOnline)) return "warn";
-  if (c.name === "backend" && !state.backendReachable) return "warn";
+  if (c.name === "configuration" && !state.configurationReachable) return "warn";
   if (fridgeIds.includes(c.name) && fridgeView(c.name)?.controls.paused) return "warn";
   return "ok";
 }
@@ -350,15 +357,14 @@ function nodeDetail(c, gw) {
   if (!c.running) return c.kind === "container" ? `container ${c.status}` : "stopped";
   if (fridgeIds.includes(c.name)) {
     const f = fridgeView(c.name);
-    return `${f.controls.paused ? "paused" : "sending"} · last #${f.lastSent || "—"} · GPIO ${f.gpioPin}${f.controls.doorOpen ? " · door open" : ""}${f.controls.spike ? " · fault" : ""}`;
+    return `Modbus :${f.port} · polled #${f.lastPolled || "—"} · GPIO ${f.gpioPin}${f.controls.paused ? " · frozen" : ""}${f.controls.doorOpen ? " · door open" : ""}${f.controls.spike ? " · fault" : ""}`;
   }
   switch (c.name) {
     case "gateway":
       if (!gw) return "starting…";
-      return `${gw.upstream === "Online" ? "publishing" : gw.hostOnline ? gw.upstream : "waiting for host STATE"} · ${gw.unsent} buffered`;
-    case "backend": return state.backendReachable ? "storing · STATE online" : "starting…";
-    case "mosquitto": return state.monitors.upstream ? "running · persistence on" : "running · connecting";
-    default: return state.monitors.edge ? `running · ${state.fridges.filter(f => f.running).length} device sessions` : "running · connecting";
+      return `polling ${state.fridges.filter(f => f.lastPolled).length} device(s) · ${gw.upstream === "Online" ? "publishing" : "broker unreachable"} · ${gw.unsent} buffered`;
+    case "configuration": return state.configurationReachable ? "serving the device list" : "starting…";
+    default: return state.monitors.upstream ? "running · persistence on" : "running · connecting";
   }
 }
 
@@ -376,10 +382,17 @@ function renderPipeline() {
       actions.innerHTML = c.actions.map(a => `<button class="btn sm${a === "crash" ? " danger" : ""}" data-act="${c.name}/${a}">${a[0].toUpperCase() + a.slice(1)}</button>`).join("");
     }
   }
-  for (const id of fridgeIds) $("l-" + id).classList.toggle("cut", !(up[id] && up["edge-broker"]));
-  $("l-gateway").classList.toggle("cut", !(up["edge-broker"] && up.gateway));
+  for (const id of fridgeIds) $("l-" + id).classList.toggle("cut", !(up[id] && up.gateway));
   $("l-mosquitto").classList.toggle("cut", !(up.gateway && up.mosquitto));
-  $("l-backend").classList.toggle("cut", !(up.mosquitto && up.backend));
+  // The gateway asks the registry every 10 s; when the registry is down it keeps polling from its cached copy.
+  const registryUp = up.configuration && state.configurationReachable;
+  $("l-config").classList.toggle("cut", !(registryUp && up.gateway));
+  $("t-config").textContent = !up.gateway ? "HTTP GET /config every 10 s · gateway stopped"
+    : registryUp ? "HTTP GET /config every 10 s · device list" : "registry unreachable · gateway using cached device list";
+  if (registryUp && up.gateway && Math.floor(Date.now() / 1000) % 10 === 0) pulse("config");
+  $("l-subscribers").classList.toggle("cut", !up.mosquitto);
+  $("n-subscribers").className = "node " + (state.monitorConnected ? "ok" : "idle");
+  $("d-subscribers").textContent = state.monitorConnected ? "receiving · MQTTX: subscribe to spBv1.0/#" : "waiting for Mosquitto";
 }
 
 function pulse(...ids) {
@@ -399,7 +412,6 @@ function renderGateway() {
   $("g-kv").innerHTML = gw ? `
     <dt>Upstream</dt><dd>${esc(gw.upstream)}</dd>
     <dt>Host STATE</dt><dd>${gw.hostOnline ? "online" : "offline: buffering"}</dd>
-    <dt>Edge intake</dt><dd>${gw.intakeConnected ? "subscribed" : "disconnected"}</dd>
     <dt>Session</dt><dd>bdSeq ${esc(gw.bdSeq)}</dd>
     <dt>Last sent</dt><dd>${esc(gw.lastPublished ?? "—")}</dd>` : `<dt>Status</dt><dd>gateway not running</dd>`;
 }
@@ -407,10 +419,10 @@ function renderGateway() {
 function renderControls() {
   const cell = (f, on, cmdOn, cmdOff, textOn, textOff) =>
     `<button class="btn sm${on ? " on" : ""}" data-cmd="${f.id}/${on ? cmdOff : cmdOn}"${f.running && !busy ? "" : " disabled"}>${on ? textOn : textOff}</button>`;
-  $("controls").innerHTML = `<span class="h">Fridge</span><span class="h">Last</span><span class="h">Door</span><span class="h">Cooling</span><span class="h">Readings</span>` +
+  $("controls").innerHTML = `<span class="h">Fridge</span><span class="h">Polled</span><span class="h">Door</span><span class="h">Cooling</span><span class="h">Readings</span>` +
     state.fridges.map(f => `
       <span class="who"><span class="swatch" style="background:${color(f.id)}"></span>${esc(f.id)}</span>
-      <span class="num">#${f.lastSent || "—"}</span>
+      <span class="num">#${f.lastPolled || "—"}</span>
       ${cell(f, f.controls.doorOpen, "door-open", "door-close", "Close door", "Open door")}
       ${cell(f, f.controls.spike, "spike-on", "spike-off", "Fix cooling", "Start fault")}
       ${cell(f, f.controls.paused, "pause", "resume", "Resume", "Pause")}`).join("");
@@ -428,7 +440,7 @@ function renderScenario() {
   $("result").innerHTML = s.result ? `<div class="result ${s.passed ? "pass" : "fail"}">${s.passed ? "PASS" : "FAIL"}${s.result.split(" · ").map(line => `<div>${esc(line)}</div>`).join("")}</div>` : "";
 }
 
-// Backend views
+// What arrived on Mosquitto (the console's own Sparkplug subscription)
 function setStat(id, value, tone) {
   const el = $(id);
   el.querySelector(".value").textContent = value;
@@ -436,13 +448,13 @@ function setStat(id, value, tone) {
   el.classList.toggle("bad", tone === "bad");
 }
 
-function renderBackend() {
-  const stale = !state.backendReachable;
+function renderView() {
+  const stale = !state.monitorConnected;
   ["stats", "device-panel", "chart-panel"].forEach(id => $(id).classList.toggle("stale", stale));
-  $("backend-pill").className = "pill " + (state.backendReachable ? "ok" : "bad");
-  $("backend-pill").lastElementChild.textContent = state.backendReachable ? "Backend live" : "Backend down: showing last known data";
-  if (!backend) return;
-  const { gateways, devices, summaries, histories } = backend;
+  $("monitor-pill").className = "pill " + (state.monitorConnected ? "ok" : "bad");
+  $("monitor-pill").lastElementChild.textContent = state.monitorConnected ? "Subscribed to Mosquitto" : "Mosquitto unreachable: showing last known data";
+  if (!view) return;
+  const { gateways, devices, summaries, histories } = view;
   const gateway = gateways[0];
   const sum = key => summaries.reduce((total, s) => total + (s[key] ?? 0), 0);
   setStat("s-readings", sum("readings"));
@@ -454,16 +466,17 @@ function renderBackend() {
   lastHistorical = historical;
   setStat("s-session", gateway ? `${gateway.bdSeq}${gateway.online ? "" : " (offline)"}` : "—");
 
-  $("devices").innerHTML = fridgeIds.map(id => {
+  $("devices").innerHTML = deviceIds.map(id => {
     const d = devices.find(x => x.deviceId === id), s = summaries.find(x => x.deviceId === id);
     if (!d) return `<div class="dcard" style="--dc:${color(id)}"><div class="id">${esc(id)}</div><div class="empty">not born yet</div></div>`;
     return `<div class="dcard" style="--dc:${color(id)}">
       <div class="top"><span class="id">${esc(id)}</span><span class="meta">GPIO ${esc(d.gpioPin)}</span></div>
-      <div class="temp">${d.temperature.toFixed(1)} °C</div>
-      <div class="meta">${d.humidity.toFixed(0)}% · door ${d.doorOpen ? "open" : "closed"} · #${esc(s?.lastSeq ?? "—")} · missing ${esc(s?.missing ?? 0)}</div>
+      <div class="temp">${d.temperature != null ? d.temperature.toFixed(1) + " °C" : "—"}</div>
+      <div class="meta">${d.humidity != null ? d.humidity.toFixed(0) + "%" : "—"} · door ${d.doorOpen ? "open" : "closed"} · #${esc(s?.lastSeq ?? "—")} · missing ${esc(s?.missing ?? 0)}</div>
       <div class="tags">
         <span class="tag ${d.online ? "ok" : "bad"}">${d.online ? "Online" : "Offline"}</span>
         ${d.highTemperature ? '<span class="tag bad">Alarm</span>' : ""}
+        ${d.quality === "bad" ? `<span class="tag bad" title="${esc(d.badMetrics.join(", "))}">Bad quality: ${esc(d.badMetrics.join(", "))}</span>` : d.quality === "stale" ? '<span class="tag warn">Stale</span>' : '<span class="tag ok">Good quality</span>'}
         ${d.doorOpen ? '<span class="tag warn">Door open</span>' : ""}
       </div></div>`;
   }).join("");
@@ -471,14 +484,13 @@ function renderBackend() {
 }
 
 function renderChart(histories) {
-  const series = fridgeIds.map(id => ({
+  const series = deviceIds.map(id => ({
     id,
-    points: (histories[id] ?? []).map(h => h.event)
-      .filter(e => (e.messageType === "DDATA" || e.messageType === "DBIRTH") && num(e.metrics, "Temperature") != null)
-      .map(e => ({ t: new Date(e.recordedAt).getTime(), v: num(e.metrics, "Temperature"), hist: e.historical }))
+    points: (histories[id] ?? [])
+      .map(p => ({ t: new Date(p.recordedAt).getTime(), v: p.temperature, hist: p.historical }))
       .sort((a, b) => a.t - b.t).slice(-60)
   }));
-  $("legend").innerHTML = fridgeIds.map(id => `<span><i style="background:${color(id)}"></i>${esc(id)}</span>`).join("") +
+  $("legend").innerHTML = deviceIds.map(id => `<span><i style="background:${color(id)}"></i>${esc(id)}</span>`).join("") +
     '<span><i class="ring"></i>Replayed (historical)</span><span><i style="background:var(--bad)"></i>Alarm 8 °C</span>';
   const all = series.flatMap(s => s.points);
   const svg = $("chart");
@@ -505,22 +517,8 @@ function renderChart(histories) {
 }
 
 // Feed
-function describe(e) {
-  const m = e.metrics || {};
-  switch (e.messageType) {
-    case "NBIRTH": return `gateway ${e.gatewayId} born · bdSeq ${e.bdSeq}`;
-    case "NDEATH": return `gateway ${e.gatewayId} died · bdSeq ${e.bdSeq}`;
-    case "NDATA": return `heartbeat · uptime ${num(m, "UptimeSeconds") ?? "—"}s`;
-    case "DDEATH": return `${e.deviceId} lost`;
-    default: {
-      const seq = num(m, "DeviceSeq");
-      return `${e.deviceId} ${e.messageType === "DBIRTH" ? "born " : ""}${seq != null ? "#" + seq : ""} · ${num(m, "Temperature")} °C · ${num(m, "Humidity")}% · door ${num(m, "GpioValue") === 1 ? "open" : "closed"}`;
-    }
-  }
-}
-
 async function renderFeed() {
-  const names = ["gateway", "backend", ...fridgeIds];
+  const names = ["gateway", "configuration"];
   $("tabnote").innerHTML = esc(TAB_NOTES[tab]) + (tab === "logs"
     ? ` <select id="log-name">${names.map(n => `<option${n === logName ? " selected" : ""}>${n}</option>`).join("")}</select>` : "");
   const feed = $("feed");
@@ -532,16 +530,17 @@ async function renderFeed() {
       if (atBottom) feed.scrollTop = feed.scrollHeight;
       return;
     }
-    if (tab === "stored") {
-      const events = backend?.events ?? [];
-      const previous = lastEventId;
-      lastEventId = Math.max(lastEventId, events[0]?.id ?? 0);
-      feed.innerHTML = events.length ? events.map(({ id, appliedToState, event: e }) => `
-        <div class="row${previous && id > previous ? " new" : ""}">
-          <time>${esc(time(e.recordedAt ?? e.observedAt))}</time>
-          <span class="badge b-${esc(e.messageType)}">${esc(e.messageType)}</span>
-          <span class="text">${e.deviceId ? `<span class="swatch" style="background:${color(e.deviceId)};margin-right:6px"></span>` : ""}${e.historical ? '<span class="tag warn">historical</span>' : ""}${appliedToState ? "" : '<span class="tag">history only</span>'}${e.seq != null ? `<span class="tag">seq ${esc(e.seq)}</span>` : ""}${esc(describe(e))}</span>
-        </div>`).join("") : `<div class="empty">${state?.backendReachable ? "Nothing stored yet." : "Backend is down."}</div>`;
+    if (tab === "registry") {
+      const devices = await getJson("/api/config/devices");
+      feed.innerHTML = `<div style="margin-bottom:8px"><button class="btn sm primary" data-registry="add">Add device</button></div>` +
+        (devices.length ? devices.map(d => `
+        <div class="row" style="grid-template-columns: minmax(0,1fr) auto">
+          <span class="text"><b>${esc(d.id)}</b> · ${esc(d.host)}:${esc(d.port)} unit ${esc(d.unitId)} · every ${esc(d.pollIntervalSeconds)}s${d.gpioPin != null ? ` · GPIO ${esc(d.gpioPin)}` : ""}
+            ${d.enabled ? '<span class="tag ok">enabled</span>' : '<span class="tag">disabled</span>'}<br>
+            <span class="sub" style="font-size:12px">${d.metrics.map(m => `${esc(m.name)}: ${esc(m.register)} ${esc(m.address)} ×${esc(m.scale)} ${esc(m.unit)}`).join(" · ")}</span></span>
+          <span style="display:flex;gap:4px"><button class="btn sm" data-registry="${d.enabled ? "disable" : "enable"}/${esc(d.id)}">${d.enabled ? "Disable" : "Enable"}</button>
+            <button class="btn sm danger" data-registry="delete/${esc(d.id)}">Remove</button></span>
+        </div>`).join("") : '<div class="empty">No devices registered.</div>');
       return;
     }
     const messages = await getJson("/api/wire/" + tab);
@@ -560,38 +559,65 @@ async function renderFeed() {
   }
 }
 
+// Device registry actions go to the configuration service; data acquisition picks them up on its next refresh.
+async function registryAction(action) {
+  const [verb, id] = action.split("/");
+  if (verb === "delete") {
+    if (!confirm(`Remove ${id} from the registry? Data acquisition stops polling it and it gets a DDEATH.`)) return;
+    const response = await fetch(`/api/config/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast(response.ok ? `${id} removed from the registry.` : "Remove failed.", !response.ok);
+  } else if (verb === "add") {
+    const newId = prompt("New device ID", "fridge-04");
+    if (!newId) return;
+    const port = Number(prompt("Modbus TCP port of the device (5021–5023 are the running simulators)", "5021"));
+    if (!port) return;
+    const body = {
+      id: newId, enabled: true, protocol: "ModbusTcp", host: "127.0.0.1", port, unitId: 1, pollIntervalSeconds: 3,
+      gpioPin: 22, description: "Added from the demo console",
+      metrics: [
+        { name: "Temperature", register: "holding", address: 0, scale: 0.1, unit: "°C" },
+        { name: "Humidity", register: "holding", address: 1, scale: 0.1, unit: "%" },
+        { name: "GpioValue", register: "coil", address: 0, scale: 1, unit: "door" }]
+    };
+    const response = await fetch("/api/config/devices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const result = await response.json().catch(() => ({}));
+    toast(response.ok ? `${newId} added: data acquisition starts polling it within about 10 seconds.` : result.message || "Add failed.", !response.ok);
+  } else {
+    await post(`/api/config/devices/${encodeURIComponent(id)}/enabled/${verb === "enable"}`, `${verb} ${id}`);
+    return;
+  }
+  renderFeed();
+}
+
 // Polling
 async function refresh() {
   try {
     state = await getJson("/api/state");
   } catch {
-    $("backend-pill").className = "pill bad";
-    $("backend-pill").lastElementChild.textContent = "Demo console not reachable";
+    $("monitor-pill").className = "pill bad";
+    $("monitor-pill").lastElementChild.textContent = "Demo console not reachable";
     return;
   }
   const ids = state.fridges.map(f => f.id);
   if (ids.join() !== fridgeIds.join()) { fridgeIds = ids; buildPipeline(); }
-  const previousEvent = backend?.events?.[0]?.id ?? 0;
-  if (state.backendReachable) {
-    try {
-      const [gateways, devices, events, summaries, ...histories] = await Promise.all([
-        getJson("/api/backend/gateways"), getJson("/api/backend/devices"),
-        getJson("/api/backend/events?limit=200"), getJson("/api/backend/events/summary"),
-        ...fridgeIds.map(id => getJson(`/api/backend/devices/${encodeURIComponent(id)}/history?limit=120`).catch(() => []))]);
-      backend = { gateways, devices, events, summaries, histories: Object.fromEntries(fridgeIds.map((id, i) => [id, histories[i]])) };
-    } catch { /* keep the last known data */ }
-  }
+  deviceIds = [...new Set([...fridgeIds, ...(view?.devices ?? []).map(d => d.deviceId)])];
+  const previousCounts = Object.fromEntries((view?.summaries ?? []).map(s => [s.deviceId, s.readings]));
+  try {
+    const [gateways, devices, summaries, ...histories] = await Promise.all([
+      getJson("/api/view/gateways"), getJson("/api/view/devices"), getJson("/api/view/summary"),
+      ...deviceIds.map(id => getJson(`/api/view/history/${encodeURIComponent(id)}`).catch(() => []))]);
+    view = { gateways, devices, summaries, histories: Object.fromEntries(deviceIds.map((id, i) => [id, histories[i]])) };
+  } catch { /* keep the last known data */ }
   renderPipeline();
   renderGateway();
   renderControls();
   renderScenario();
-  renderBackend();
-  const fresh = previousEvent ? (backend?.events ?? []).filter(e => e.id > previousEvent) : [];
-  const readers = [...new Set(fresh.filter(e => /^D(DATA|BIRTH)$/.test(e.event.messageType)).map(e => e.event.deviceId))];
-  if (readers.length) pulse(...readers, "gateway", "mosquitto", "backend");
-  else if (fresh.length) pulse("mosquitto", "backend");
-  else if (state.gateway?.unsent > 0 || !state.backendReachable)
-    pulse(...state.fridges.filter(f => f.running && !f.controls.paused).map(f => f.id), "gateway");
+  renderView();
+  // Animate the path for each device whose reading count went up since the last refresh.
+  const arrived = (view?.summaries ?? []).filter(s => previousCounts[s.deviceId] !== undefined && s.readings > previousCounts[s.deviceId]).map(s => s.deviceId);
+  if (arrived.length) pulse(...arrived, "mosquitto", "subscribers");
+  else if (state.gateway?.unsent > 0)
+    pulse(...state.fridges.filter(f => f.running && !f.controls.paused).map(f => f.id));
   await renderFeed();
 }
 
@@ -600,6 +626,8 @@ document.addEventListener("click", e => {
   if (act) { const [name, action] = act.dataset.act.split("/"); post(`/api/components/${name}/${action}`, `${CORE[name]?.label ?? name}: ${action}`); return; }
   const cmd = e.target.closest("[data-cmd]");
   if (cmd) { const [id, command] = cmd.dataset.cmd.split("/"); post(`/api/fridges/${id}/${command}`, `${id}: ${cmd.textContent.toLowerCase()}`); return; }
+  const registry = e.target.closest("[data-registry]");
+  if (registry) { registryAction(registry.dataset.registry); return; }
   const demo = e.target.closest("[data-demo]");
   if (demo) {
     if (demo.dataset.demo === "reset" && !confirm("Reset wipes the broker data and demo state, then starts everything fresh. Continue?")) return;
