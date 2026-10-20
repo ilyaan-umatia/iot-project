@@ -1,4 +1,4 @@
-namespace EdgeGateway.BrokerMqtt.Sparkplug;
+namespace EdgeGateway.Gateway.Sparkplug;
 
 public sealed class SparkplugSequence
 {

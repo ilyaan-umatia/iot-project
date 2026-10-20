@@ -1,11 +1,11 @@
 using System.Diagnostics;
-using EdgeGateway.BrokerMqtt.Configuration;
-using EdgeGateway.BrokerMqtt.Sparkplug;
-using EdgeGateway.BrokerMqtt.Storage;
+using EdgeGateway.Gateway.Configuration;
+using EdgeGateway.Gateway.Sparkplug;
+using EdgeGateway.Gateway.Storage;
 using Google.Protobuf;
 using MQTTnet.Protocol;
 
-namespace EdgeGateway.BrokerMqtt.Connection;
+namespace EdgeGateway.Gateway.Connection;
 
 public sealed class GatewayRunner(MqttConnection connection, Outbox outbox, GatewaySettings settings)
 {
@@ -184,7 +184,9 @@ public sealed class GatewayRunner(MqttConnection connection, Outbox outbox, Gate
         };
         await connection.PublishAsync(topic, payload.ToByteArray(), cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
         var detail = row.Reading is { } reading
-            ? $" #{reading.DeviceSeq}: temperature={reading.Temperature}C, GPIO {reading.GpioPin}={reading.GpioValue}" : "";
+            ? $" #{reading.DeviceSeq}: " + string.Join(", ", reading.Metrics.Select(metric =>
+                $"{metric.Key}={metric.Value.Number?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? metric.Value.Boolean?.ToString() ?? metric.Value.Quality}"))
+            : "";
         LastPublished = $"{row.Kind} {row.DeviceId}{(row.Reading is { } sent ? $" #{sent.DeviceSeq}" : "")}";
         Console.WriteLine($"{row.Kind} {row.DeviceId}{detail} (seq {sequence}{(historical ? ", historical" : "")})");
     }

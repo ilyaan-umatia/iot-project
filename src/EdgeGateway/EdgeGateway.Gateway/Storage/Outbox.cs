@@ -2,7 +2,7 @@ using System.Text.Json;
 using IoT.Contracts;
 using Microsoft.Data.Sqlite;
 
-namespace EdgeGateway.BrokerMqtt.Storage;
+namespace EdgeGateway.Gateway.Storage;
 
 public sealed record OutboxRow(long Id, string Kind, string DeviceId, DeviceReading? Reading, DateTimeOffset CreatedAt);
 
@@ -43,6 +43,8 @@ public sealed class Outbox : IDisposable
                 PublishedReading TEXT
             );
             """);
+        if (Scalar("SELECT 1 FROM pragma_table_info('Devices') WHERE name = 'MetricSignature'") is null)
+            Execute("ALTER TABLE Devices ADD COLUMN MetricSignature TEXT");
     }
 
     // Returns false for a reading the edge broker redelivered.
@@ -56,11 +58,15 @@ public sealed class Outbox : IDisposable
                 return false;
             var online = Scalar("SELECT IntakeOnline FROM Devices WHERE DeviceId = $device", transaction,
                 ("$device", reading.DeviceId)) is 1L;
-            Insert(online ? "DDATA" : "DBIRTH", reading.DeviceId, reading, transaction);
+            // A changed metric list (from a configuration change) needs a new DBIRTH describing it.
+            var signature = reading.MetricSignature();
+            var sameMetrics = Scalar("SELECT MetricSignature FROM Devices WHERE DeviceId = $device", transaction,
+                ("$device", reading.DeviceId)) as string == signature;
+            Insert(online && sameMetrics ? "DDATA" : "DBIRTH", reading.DeviceId, reading, transaction);
             Execute("""
-                INSERT INTO Devices (DeviceId, IntakeOnline) VALUES ($device, 1)
-                ON CONFLICT(DeviceId) DO UPDATE SET IntakeOnline = 1
-                """, transaction, ("$device", reading.DeviceId));
+                INSERT INTO Devices (DeviceId, IntakeOnline, MetricSignature) VALUES ($device, 1, $signature)
+                ON CONFLICT(DeviceId) DO UPDATE SET IntakeOnline = 1, MetricSignature = $signature
+                """, transaction, ("$device", reading.DeviceId), ("$signature", signature));
             transaction.Commit();
         }
         Signal();

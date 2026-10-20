@@ -1,16 +1,27 @@
-using EdgeGateway.BrokerMqtt.Configuration;
-using EdgeGateway.BrokerMqtt.Connection;
-using EdgeGateway.BrokerMqtt.Intake;
-using EdgeGateway.BrokerMqtt.Storage;
+﻿// Edge gateway: polls the Modbus devices listed by the configuration service, buffers every reading in
+// a SQLite outbox and publishes it to Mosquitto as Sparkplug B.
+using EdgeGateway.Gateway.Configuration;
+using EdgeGateway.Gateway.Connection;
+using EdgeGateway.Gateway.Acquisition;
+using EdgeGateway.Gateway.Storage;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 
 using var stop = new CancellationTokenSource();
-Console.CancelKeyPress += (_, eventArgs) =>
+// Ctrl+C (SIGINT) and SIGTERM (docker stop, Kubernetes, systemd) both shut down cleanly: stop polling,
+// let the current publish finish, send NDEATH and disconnect. If that hangs, exit after 15 seconds anyway;
+// nothing is lost because the outbox is on disk and the broker publishes the NDEATH Will.
+void RequestShutdown(PosixSignalContext context)
 {
-    eventArgs.Cancel = true;
+    context.Cancel = true;
+    if (stop.IsCancellationRequested) return;
+    Console.WriteLine($"{context.Signal} received. Shutting down.");
     stop.Cancel();
-};
+    _ = Task.Delay(TimeSpan.FromSeconds(15)).ContinueWith(_ => Environment.Exit(1), TaskScheduler.Default);
+}
+using var interrupt = PosixSignalRegistration.Create(PosixSignal.SIGINT, RequestShutdown);
+using var terminate = PosixSignalRegistration.Create(PosixSignal.SIGTERM, RequestShutdown);
 try
 {
     var configuration = new ConfigurationBuilder().SetBasePath(AppContext.BaseDirectory)
@@ -19,7 +30,8 @@ try
         ?? throw new InvalidOperationException("Could not read appsettings.json.");
     using var outbox = new Outbox(settings.Gateway.DatabasePath);
     using var connection = new MqttConnection(settings.Mqtt, settings.Sparkplug);
-    var intake = new AcquisitionReceiver(settings.NetMq, outbox);
+    using var config = new ConfigClient(settings.Daq);
+    var acquisition = new AcquisitionService(settings.Daq, config, outbox);
     var runner = new GatewayRunner(connection, outbox, settings);
     Console.WriteLine($"Outbox: {settings.Gateway.DatabasePath} ({outbox.CountUnsent()} unsent). Type stop to exit.");
     var input = Task.Run(() =>
@@ -33,8 +45,8 @@ try
             if (command != "") Console.WriteLine("Commands: stop.");
         }
     });
-    // Intake keeps buffering while the upstream connection is down.
-    var receiving = intake.RunAsync(stop.Token);
+    // Polling commits to the outbox and keeps going while the broker is down; publishing drains it.
+    var receiving = acquisition.RunAsync(stop.Token);
     var running = runner.RunAsync(stop.Token);
     var reporting = WriteStatusAsync(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(settings.Gateway.DatabasePath))!,
         "status.json"), stop.Token);
@@ -92,4 +104,3 @@ catch (Exception error)
     Console.Error.WriteLine($"Gateway error: {error.Message}");
     Environment.ExitCode = 1;
 }
-finally { NetMQ.NetMQConfig.Cleanup(); }

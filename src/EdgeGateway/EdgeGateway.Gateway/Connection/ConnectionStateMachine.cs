@@ -1,4 +1,4 @@
-namespace EdgeGateway.BrokerMqtt.Connection;
+namespace EdgeGateway.Gateway.Connection;
 
 public enum ConnectionState
 {

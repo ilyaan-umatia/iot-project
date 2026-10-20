@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace EdgeGateway.BrokerMqtt.Sparkplug;
+namespace EdgeGateway.Gateway.Sparkplug;
 
 // Tracks the Primary Host Application's STATE for one MQTT session.
 public sealed class PrimaryHostState

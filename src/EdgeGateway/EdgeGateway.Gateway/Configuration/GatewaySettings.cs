@@ -1,9 +1,9 @@
-namespace EdgeGateway.BrokerMqtt.Configuration;
+namespace EdgeGateway.Gateway.Configuration;
 
 public sealed class GatewaySettings
 {
     public MqttSettings Mqtt { get; set; } = new();
-    public IoT.Contracts.NetMqSettings NetMq { get; set; } = new();
+    public DaqSettings Daq { get; set; } = new();
     public SparkplugSettings Sparkplug { get; set; } = new();
     public GatewayOutboxSettings Gateway { get; set; } = new();
 }

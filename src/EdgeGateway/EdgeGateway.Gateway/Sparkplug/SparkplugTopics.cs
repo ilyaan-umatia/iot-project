@@ -1,6 +1,6 @@
-using EdgeGateway.BrokerMqtt.Configuration;
+using EdgeGateway.Gateway.Configuration;
 
-namespace EdgeGateway.BrokerMqtt.Sparkplug;
+namespace EdgeGateway.Gateway.Sparkplug;
 
 public static class SparkplugTopics
 {
