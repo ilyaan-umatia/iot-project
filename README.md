@@ -1,20 +1,49 @@
 # IoT Project
 
-Requires .NET 8 SDK, Docker Desktop and MQTTX.
+Requires .NET 8 SDK and Docker Desktop. MQTTX or MQTT Explorer to watch the broker.
 
 ```text
-Simulator(s) → Edge Mosquitto (:1883) → EdgeGateway.DataAcquisition (intake)
-    → NetMQ (:5555) → EdgeGateway.BrokerMqtt [SQLite outbox → Sparkplug B]
-    → Mosquitto over TLS (:8883) → MQTTX
+EdgeGateway.Configuration (device registry, REST :5300)
+        │ device list (fetched every 10 s, cached locally)
+        ▼
+Modbus devices ◄── Modbus TCP polling ── EdgeGateway.Gateway [poll → SQLite outbox → Sparkplug B]
+(pymodbus simulators :5021-5023)                    │ MQTT over TLS
+                                                    ▼
+                                   Mosquitto (:8883) ──► MQTTX / MQTT Explorer, demo console
 ```
 
-The backend is temporarily outside the active flow. The simulator and edge broker remain as the reading source until the acquisition layer is ready.
+- **Devices:** each fridge is a [pymodbus](https://github.com/pymodbus-dev/pymodbus) Modbus TCP server in Docker (`simulators/modbus`). Any Modbus tool can read or write them.
+- **Configuration service:** stores each device's address, unit ID, poll interval, GPIO pin and register map. `GET/POST/PUT/DELETE /devices`, `GET /config`. It holds configuration only; online/offline comes from the gateway. Seeded with fridge-01..03 on first start.
+- **Gateway (one process):** one poll loop per enabled device. Each reading is numbered (persisted per device) and committed to the SQLite outbox the moment it is polled, so it survives a gateway crash or a broker outage. The publishing loop drains the outbox in order as Sparkplug B (NBIRTH/DBIRTH/DDATA/DDEATH, Rebirth, historical replay) and marks a row sent only after the broker's acknowledgement.
+  - After 3 failed polls a device is reported offline (DDEATH); the next good poll brings it back (DBIRTH).
+  - Devices added, changed or removed in the registry apply within about 10 seconds; a changed metric list triggers a new DBIRTH.
+  - If the configuration service is down, it keeps polling from its cached device list.
 
-`EdgeGateway.DataAcquisition` keeps the existing edge intake. `EdgeGateway.BrokerMqtt` runs separately and owns the upstream MQTT connection, Sparkplug lifecycle and SQLite outbox. NetMQ Request/Reply connects them; the reply confirms the outbox commit before Gateway acknowledges the edge MQTT message.
+## Reading registers
+
+Each metric in the registry says where its value lives and how to decode it:
+
+| Field | Meaning |
+|---|---|
+| `register` | `holding`, `input` (16-bit registers), `coil`, `discrete` (single bits) |
+| `address` | first register (0-based) |
+| `dataType` | `int16` (default), `uint16`, `int32`, `uint32`, `float32` for registers; `bool` for bits |
+| `wordOrder` | 32-bit types span two registers: `big` (default, high word first) or `little` (word-swapped devices) |
+| `scale`, `unit` | value = decoded × scale, e.g. `0.1` for a register holding tenths |
+
+The gateway groups each device's metrics into **frames**: one read request per run of nearby registers of the same type (up to 125 registers or 2000 bits; gaps of up to 8 registers are read through), then decodes each metric from its slice. The demo fridges use one holding-register frame (0–13) and one coil frame:
+
+| Metric | Register | Type |
+|---|---|---|
+| Temperature | holding 0, × 0.1 °C | int16 |
+| Humidity | holding 1, × 0.1 % | uint16 |
+| CompressorPower | holding 10–11, W | float32, big word order |
+| DoorOpenings | holding 12–13 | uint32, big word order |
+| GpioValue (door) | coil 0 | bool |
 
 ## Configuration
 
-Create root `appsettings.json` (ignored by Git). These are the minimum settings; the settings classes provide the other defaults:
+Root `appsettings.json` (ignored by Git) holds shared settings; the settings classes provide the other defaults:
 
 ```json
 {
@@ -23,56 +52,52 @@ Create root `appsettings.json` (ignored by Git). These are the minimum settings;
 }
 ```
 
-Keep `HostId` empty for this flow. A configured HostId makes the gateway wait for that Primary Host's online STATE. MQTTX does not provide that role.
+The backend (`Application.Api`) is not part of this flow; MQTTX and the demo console are the consumers. A non-empty `HostId` would make the gateway wait for a Sparkplug Primary Host's STATE, so both launchers start the gateway with an empty one.
 
-Both applications default to `NetMq:Endpoint = tcp://127.0.0.1:5555`. EdgeGateway.BrokerMqtt binds; EdgeGateway.DataAcquisition connects. Override that setting in root appsettings.json if the port is occupied. Keep this internal connection local.
-
-When moving an existing setup, keep `Mqtt:StateDirectory` and `Gateway:DatabasePath` pointing to the existing counter and outbox; EdgeGateway.BrokerMqtt owns these now. Without explicit paths, state defaults to the application's output directory. Stop the old combined application before running the split projects. EdgeGateway.DataAcquisition keeps the existing `gateway-01-intake` identity, and EdgeGateway.BrokerMqtt keeps `gateway-01`.
-
-## Run manually
-
-From the project folder:
+## Demo console (recommended)
 
 ```powershell
-./scripts/New-LocalBrokerCertificate.ps1 # first setup only; reuse existing valid certificates
-docker compose up -d
+./scripts/New-LocalBrokerCertificate.ps1   # first setup only
+./scripts/Start-Demo.ps1
 ```
 
-In MQTTX, connect to `127.0.0.1:8883` with TLS enabled, use `broker/certs/broker.crt` as the trusted certificate, and use a unique client ID (not `gateway-01`). Subscribe to `spBv1.0/warehouse-01/#` before starting the gateway. For Protobuf decoding, import `schemas/sparkplug_b.proto` and select `org.eclipse.tahu.protobuf.Payload`.
+This opens `http://127.0.0.1:5200` (loopback only, because it starts and kills processes). **Reset demo** starts fresh: simulators and broker in Docker, then the configuration service and the gateway. No backend: the console reads Mosquitto itself with a persistent QoS 1 Sparkplug subscription, like MQTTX.
 
-Run each application in a separate terminal:
+- **Data path:** Start, Stop and Crash for every component; Start, Stop, Restart and Crash for each fridge simulator and the broker.
+- **Fridges:** door, cooling fault and pause. The console runs a small thermal model and writes it into each simulator over Modbus, the way sensors update a PLC.
+- **Device registry tab:** add, enable, disable or remove devices in the configuration service, and watch the gateway follow.
+- **Resilience test:** crashes Mosquitto, the gateway, the configuration service and a simulator, then checks every reading the gateway polled arrived on Mosquitto exactly once.
+- **Device cards, chart and missing/duplicate counts:** rebuilt from the Sparkplug messages on Mosquitto, using each reading's DeviceSeq.
+- **On the wire:** decoded Sparkplug traffic on Mosquitto, plus the logs of each process.
+
+## Edge only, up to Mosquitto
 
 ```powershell
-dotnet run --project src/EdgeGateway/EdgeGateway.BrokerMqtt
-dotnet run --project src/EdgeGateway/EdgeGateway.DataAcquisition
-# Wait for "Intake subscribed", then start each simulator:
-dotnet run --project src/Device.Simulator -- --Simulator:DeviceId=fridge-01
-dotnet run --project src/Device.Simulator -- --Simulator:DeviceId=fridge-02
-dotnet run --project src/Device.Simulator -- --Simulator:DeviceId=fridge-03
+./scripts/Start-IoT.ps1
 ```
 
-On empty brokers, the gateway must subscribe before the simulators publish so its edge session can hold readings during a gateway outage.
+This starts the simulators and the configuration service, and runs the gateway in the terminal. The simulators start with zeroed registers: write values with a Modbus tool (Modbus Poll, QModMaster) or use the demo console.
 
-Optional: after subscribing in MQTTX, `./scripts/Start-IoT.ps1` starts the brokers, both applications and one simulator. It does not start the backend. Launcher cleanup force-stops both applications; use manual terminals and type `stop` for graceful shutdown.
+In MQTTX, connect to `127.0.0.1:8883` with TLS, trust `broker/certs/broker.crt`, use a unique client ID, and subscribe to `spBv1.0/warehouse-01/#` before starting the gateway. To decode payloads, import `schemas/sparkplug_b.proto` and select `org.eclipse.tahu.protobuf.Payload`.
 
-## Check in MQTTX
+## Reliability behaviour
 
-- NBIRTH/DBIRTH announce the node and devices. NDATA reports gateway uptime; DDATA carries readings.
-- Type `stop` in a simulator to see DDEATH; restart it to see DBIRTH. EdgeGateway.BrokerMqtt `stop` publishes NDEATH. Force-stopping it lets Mosquitto publish its NDEATH Last Will once the loss is detected.
-- Stop EdgeGateway.BrokerMqtt: Gateway waits for confirmation and the edge session holds pending readings. Restart it to resume. Stop EdgeGateway.DataAcquisition: EdgeGateway.BrokerMqtt can still drain its outbox; new readings wait at the edge broker until intake returns. Stopping intake alone does not publish NDEATH or mark all devices offline.
-- Stop the upstream broker while simulators continue: the outbox buffers readings. On reconnect, EdgeGateway.BrokerMqtt sends births and replays queued data with historical markers on DDATA.
-- NCMD/Rebirth handling remains available in EdgeGateway.BrokerMqtt. Automatic host requests are absent while the backend is disconnected. Subscribe before EdgeGateway.BrokerMqtt startup to capture births; for a late MQTTX connection, restart EdgeGateway.BrokerMqtt manually to see fresh births.
+- **Automatic reconnect:** the gateway retries Mosquitto with backoff (2 s doubling to 30 s), then sends a new NBIRTH and a DBIRTH per online device.
+- **Data restored after disconnects:** every polled reading is committed to the SQLite outbox first; after a reconnect the backlog is replayed in order, marked `is_historical`, and each row is marked sent only after the broker's acknowledgement.
+- **Source timestamps:** a reading carries the time the poll request was sent, and keeps it through buffering and replay.
+- **Data quality:** each value is Good, Bad or Stale, using the Sparkplug `Quality` metric property (192, 0, 500); a good value carries no property. A failed poll on an online device produces a sample with every value Bad (a null metric), until the third failure reports the device offline (DDEATH), after which its values count as Stale. A float register holding NaN or infinity is reported Bad on its own.
+- **Graceful shutdown:** SIGTERM (docker stop, Kubernetes, systemd) and Ctrl+C stop polling, let the current publish finish, send NDEATH and disconnect, with a 15-second limit. Nothing is lost if the limit is hit: the outbox is on disk and the broker publishes the NDEATH Will.
+- **Not bounded yet:** the outbox has no size limit; a long outage grows it until the disk fills.
 
-The outbox marks a message sent after the broker acknowledges it. This does not confirm that MQTTX or another subscriber received or processed it. MQTTX being disconnected does not pause publishing.
-
-## Preserved backend tools
-
-`Application.Api`, `Demo.Control`, `Start-Demo.ps1` and `Test-Resilience.ps1` are retained for the earlier backend flow. They are not part of this demo. The old dashboard starts the backend, and the resilience script resets broker volumes; do not use them for this workflow. Returning to that flow also requires restoring a matching Primary Host ID.
-
-## Checks and existing limits
+## Checks and limits
 
 ```powershell
 dotnet run --project tests/IoT.Checks
 ```
 
-Existing Sparkplug deviations remain: data uses QoS 1 and the retained backend uses a persistent MQTT session. Outbox size limits, clock drift and metric aliases are not handled. A crash after broker acceptance but before marking a row sent can cause redelivery; a DBIRTH reading can appear twice in backend history.
+- **Polling gaps:** while the gateway is down, nothing is read (a gap in sampling, not lost messages). Every reading it did poll is already in the SQLite outbox.
+- **Modbus security:** Modbus has no authentication or encryption; keep devices on an isolated network. The configuration API and Mosquitto have no authentication yet.
+- **Not yet supported:** Modbus RTU (serial), byte-swapped (as opposed to word-swapped) registers, 64-bit values, strings, and Sparkplug metric aliases.
+- **Sparkplug deviations:** data uses QoS 1, and the demo console subscribes with a persistent session.
+- **Console view resets with the console:** after a console restart it counts from the readings it receives next, so earlier readings are not in its totals.
+- **Backend:** `Application.Api` stays in the repository but is outside this flow; its checks still expect the fridge metric names.
