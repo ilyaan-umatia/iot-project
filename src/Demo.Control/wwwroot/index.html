@@ -54,7 +54,7 @@
   .toast.show { opacity: 1; transform: none; }
   .toast.error { background: var(--bad); color: #fff; }
 
-  /* Pipeline: three fridges, each with its own link into the edge broker */
+  /* Pipeline: Modbus fridges, configuration service, gateway and MQTT subscribers. */
   .pipeline { display: grid; align-items: center;
     grid-template-columns: minmax(0,1.5fr) minmax(0,1.2fr) auto minmax(0,1fr) auto minmax(0,1fr); }
   .fridges { display: grid; gap: 6px; }
@@ -154,9 +154,9 @@
   .row .text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
   .row .tag { margin-right: 4px; }
   .badge { font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 6px; text-align: center; background: var(--idle-soft); color: var(--muted); }
-  .b-NBIRTH, .b-DBIRTH, .b-online { background: var(--ok-soft); color: var(--ok); }
-  .b-NDEATH, .b-DDEATH, .b-offline { background: var(--bad-soft); color: var(--bad); }
-  .b-DDATA, .b-reading { background: var(--accent-soft); color: var(--accent); }
+  .b-NBIRTH, .b-DBIRTH { background: var(--ok-soft); color: var(--ok); }
+  .b-NDEATH, .b-DDEATH { background: var(--bad-soft); color: var(--bad); }
+  .b-DDATA { background: var(--accent-soft); color: var(--accent); }
   .b-NDATA, .b-STATE, .b-NCMD { background: var(--violet-soft); color: var(--violet); }
   .logs { font: 12px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-word; margin: 0; }
   select { font: inherit; font-size: 12px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
@@ -171,7 +171,6 @@
     .linkwrap small { margin: 0 8px 0 0; }
     .link { width: 2px; height: 22px; }
     .link.flow::after { left: -2px; top: -12px; width: 6px; height: 12px; animation: down .9s linear; }
-    @keyframes down { to { top: 100%; } }
     .fridges { margin-bottom: 10px; }
     .row2, .grid { grid-template-columns: minmax(0, 1fr); }
     .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -265,7 +264,6 @@
 const $ = id => document.getElementById(id);
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const time = iso => iso ? new Date(iso).toLocaleTimeString([], { hour12: false }) : "—";
-const num = (m, k) => m?.[k]?.number;
 const CORE = {
   "configuration": { label: "Configuration", role: "Device registry · REST :5300" },
   "gateway": { label: "Gateway", role: "Modbus polling · SQLite outbox · Sparkplug edge node" },
@@ -343,7 +341,6 @@ function buildPipeline() {
 }
 
 function fridgeView(id) { return state.fridges.find(f => f.id === id); }
-function up(name) { return state.components.find(c => c.name === name)?.running; }
 
 function nodeState(c, gw) {
   if (!c.running) return "bad";

@@ -3,10 +3,8 @@ using System.Diagnostics;
 namespace Demo.Control;
 
 // One demo component run as a child process, with its console output kept for the page and a log file.
-public sealed class ManagedProcess(string name, string workspace, string logDirectory, string? instance = null)
+public sealed class ManagedProcess(string name, string workspace, string logDirectory)
 {
-    // Several components can run the same project, e.g. one simulator per fridge.
-    private readonly string _label = instance ?? name;
     private readonly object _gate = new();
     private readonly LinkedList<string> _lines = new();
     private Process? _process;
@@ -37,16 +35,16 @@ public sealed class ManagedProcess(string name, string workspace, string logDire
             foreach (var argument in arguments) start.ArgumentList.Add(argument);
             Directory.CreateDirectory(logDirectory);
             _log?.Dispose();
-            _log = new StreamWriter(Path.Combine(logDirectory, _label + ".log"), append: true) { AutoFlush = true };
+            _log = new StreamWriter(Path.Combine(logDirectory, name + ".log"), append: true) { AutoFlush = true };
             var process = new Process { StartInfo = start, EnableRaisingEvents = true };
             process.OutputDataReceived += (_, e) => { if (e.Data is not null) Append(e.Data); };
             process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Append("ERR " + e.Data); };
-            process.Exited += (_, _) => Append($"[demo] {_label} exited.");
+            process.Exited += (_, _) => Append($"[demo] {name} exited.");
             process.Start();
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
             _process = process;
-            Append($"[demo] {_label} started.");
+            Append($"[demo] {name} started.");
         }
     }
 
@@ -57,7 +55,7 @@ public sealed class ManagedProcess(string name, string workspace, string logDire
         lock (_gate) process = _process;
         if (process is { HasExited: false })
         {
-            Append($"[demo] {_label} crashed (killed).");
+            Append($"[demo] {name} crashed (killed).");
             process.Kill(entireProcessTree: true);
             process.WaitForExit(5000);
         }

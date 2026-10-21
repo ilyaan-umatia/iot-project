@@ -157,12 +157,6 @@ public sealed partial class ComponentManager : IDisposable
         return _world.Apply(fridge, command);
     }
 
-    public void SendToRunningFridges(string command)
-    {
-        foreach (var fridge in Fridges)
-            if (IsContainerRunning(fridge.Id)) _world.Apply(fridge.Id, command);
-    }
-
     // Dependency order: devices and broker, the device registry, then the gateway,
     // which reads its device list from the registry.
     public async Task StartAllAsync()

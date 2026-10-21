@@ -93,7 +93,7 @@ Console.WriteLine("PASS: GPIO door mapping, binary decoding, JSON roundtrip, lif
 var restartedDecoder = new SparkplugDecoder();
 Check(NeedsRebirth(restartedDecoder, prefix + "NDATA/gateway-01", SparkplugPayloads.NodeData(2, 5)), "Cold start did not request rebirth.");
 var offlineWithoutBirth = restartedDecoder.Decode(prefix + "NDEATH/gateway-01", SparkplugPayloads.NodeDeath(9).ToByteArray());
-Check(offlineWithoutBirth is { MessageType: "NDEATH", BdSeq: 9 }, "Independent forwarder lost death without a local birth cache.");
+Check(offlineWithoutBirth is { MessageType: "NDEATH", BdSeq: 9 }, "Decoder lost death without a local birth cache.");
 restartedDecoder.Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirth(10).ToByteArray());
 restartedDecoder.Decode(prefix + "DBIRTH/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(1, 5, 65, 17, 0).ToByteArray());
 restartedDecoder.Reset();
@@ -102,7 +102,7 @@ restartedDecoder.Decode(prefix + "NBIRTH/gateway-01", SparkplugPayloads.NodeBirt
 restartedDecoder.Decode(prefix + "DBIRTH/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(1, 5, 65, 17, 0).ToByteArray());
 Check(restartedDecoder.Decode(prefix + "DDATA/gateway-01/fridge-01", SparkplugPayloads.DeviceReading(2, 6, 65, 17, 0).ToByteArray()).Metrics["Temperature"].Number == 6,
     "Fresh births did not restore decoding after reconnect.");
-Console.WriteLine("PASS: Independent forwarder cold start, death without birth cache and manual birth recovery after reset.");
+Console.WriteLine("PASS: Decoder cold start, death without birth cache and birth recovery after reset.");
 
 var testDirectory = Path.Combine(Path.GetTempPath(), "iot-sqlite-checks-" + Guid.NewGuid().ToString("N"));
 var databasePath = Path.Combine(testDirectory, "backend.db");

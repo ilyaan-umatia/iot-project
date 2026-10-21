@@ -36,7 +36,7 @@ public sealed class ResilienceScenario(ComponentManager components, SparkplugVie
     {
         (string Label, string Explanation, Func<Task> Action, int Seconds)[] plan =
         [
-            ("Start everything", "Simulators, broker, registry, publisher and data acquisition in dependency order.",
+            ("Start everything", "Simulators, broker, configuration service and gateway in dependency order.",
                 components.StartAllAsync, 10),
             ("Crash Mosquitto", "The gateway keeps polling and stores every reading in its SQLite outbox.",
                 () => components.ActAsync(ComponentManager.Broker, "crash"), 15),
@@ -44,7 +44,7 @@ public sealed class ResilienceScenario(ComponentManager components, SparkplugVie
                 () => components.ActAsync(ComponentManager.Broker, "start"), 15),
             ("Crash gateway", "The broker publishes its NDEATH. No polling while it is down; the outbox survives on disk.",
                 () => components.ActAsync(ComponentManager.Gateway, "crash"), 10),
-            ("Restart gateway", "Unsent outbox rows go out first, then polling resumes with numbering continued.",
+            ("Restart gateway", "Polling resumes with numbering continued, while the publisher drains the saved outbox in order.",
                 () => components.ActAsync(ComponentManager.Gateway, "start"), 15),
             ("Crash configuration service", "The gateway keeps polling from its cached device list.",
                 () => components.ActAsync(ComponentManager.Configuration, "crash"), 10),

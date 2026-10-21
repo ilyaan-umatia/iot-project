@@ -2,7 +2,6 @@ using System.Buffers;
 using System.Globalization;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Text.Json;
 using IoT.Contracts;
 using MQTTnet;
 using MQTTnet.Formatter;
@@ -109,7 +108,7 @@ public sealed class WireMonitor(IConfiguration configuration, SparkplugView view
                 if (summary == "") summary = "(no metrics)";
             }
         }
-        catch (Exception error) when (error is JsonException or Google.Protobuf.InvalidProtocolBufferException)
+        catch (Google.Protobuf.InvalidProtocolBufferException)
         {
             type = "?";
             summary = $"{payload.Length} bytes (not decodable)";
