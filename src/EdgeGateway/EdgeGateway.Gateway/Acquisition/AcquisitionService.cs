@@ -1,6 +1,7 @@
 using EdgeGateway.Gateway.Configuration;
 using EdgeGateway.Gateway.Storage;
 using IoT.Contracts;
+using Microsoft.Data.Sqlite;
 
 namespace EdgeGateway.Gateway.Acquisition;
 
@@ -37,9 +38,16 @@ public sealed class AcquisitionService(DaqSettings settings, ConfigClient config
                     reachable = true;
                     if (fetched.Version != version)
                     {
-                        Apply(fetched.Devices, cancellationToken);
-                        Console.WriteLine($"Configuration v{fetched.Version}: {fetched.Devices.Length} device(s).");
-                        version = fetched.Version;
+                        try
+                        {
+                            await ApplyAsync(fetched.Devices, cancellationToken);
+                            Console.WriteLine($"Configuration v{fetched.Version}: {fetched.Devices.Length} device(s).");
+                            version = fetched.Version;
+                        }
+                        catch (SqliteException error)
+                        {
+                            Console.WriteLine($"Configuration v{fetched.Version} not applied: {error.Message}. Retrying on the next refresh.");
+                        }
                     }
                 }
                 await Task.Delay(TimeSpan.FromSeconds(settings.ConfigRefreshSeconds), cancellationToken);
@@ -52,20 +60,26 @@ public sealed class AcquisitionService(DaqSettings settings, ConfigClient config
         }
     }
 
-    private void Apply(DeviceDefinition[] devices, CancellationToken cancellationToken)
+    private async Task ApplyAsync(DeviceDefinition[] devices, CancellationToken cancellationToken)
     {
         var wanted = devices.Where(device => device.Enabled).ToDictionary(device => device.Id);
         foreach (var id in _pollers.Keys.ToArray())
         {
             if (wanted.TryGetValue(id, out var device) && _pollers[id].Poller.SameDefinition(device)) continue;
-            _pollers[id].Stop.Cancel();
-            _pollers[id].Task.Wait(TimeSpan.FromSeconds(5));
+            var (_, stop, task) = _pollers[id];
+            stop.Cancel();
+            // Wait for the final in-flight sample before recording offline, so it cannot resurrect the device.
+            try { await task.WaitAsync(cancellationToken); }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested && !cancellationToken.IsCancellationRequested) { }
+            stop.Dispose();
             _pollers.Remove(id);
-            if (!wanted.ContainsKey(id))
-            {
-                outbox.AcceptDeviceOffline(id);
-                Console.WriteLine($"Stopped polling {id} (removed from configuration).");
-            }
+            Console.WriteLine($"Stopped polling {id} (configuration changed).");
+        }
+        // Reconcile persisted intake state too: disabled/deleted devices have no poller after a restart.
+        // Keep the published state and queued readings intact; DDEATH follows them in the existing outbox order.
+        foreach (var id in outbox.GetIntakeOnlineDeviceIds().Where(id => !wanted.ContainsKey(id)))
+        {
+            if (outbox.AcceptDeviceOffline(id)) Console.WriteLine($"{id} offline (not enabled in configuration).");
         }
         foreach (var device in wanted.Values.Where(device => !_pollers.ContainsKey(device.Id)))
         {

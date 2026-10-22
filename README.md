@@ -14,9 +14,10 @@ Modbus devices ◄── Modbus TCP polling ── EdgeGateway.Gateway [poll →
 
 - **Devices:** each fridge is a [pymodbus](https://github.com/pymodbus-dev/pymodbus) Modbus TCP server in Docker (`simulators/modbus`). Any Modbus tool can read or write them.
 - **Configuration service:** stores each device's address, unit ID, poll interval, GPIO pin and register map. `GET/POST/PUT/DELETE /devices`, `GET /config`. It holds configuration only; online/offline comes from the gateway. Seeded with fridge-01..03 on first start.
-- **Gateway (one process):** one poll loop per enabled device. Each reading is numbered (persisted per device) and committed to the SQLite outbox the moment it is polled, so it survives a gateway crash or a broker outage. The publishing loop drains the outbox in order as Sparkplug B (NBIRTH/DBIRTH/DDATA/DDEATH, Rebirth, historical replay) and marks a row sent only after the broker's acknowledgement.
+- **Gateway (one process):** one poll loop per enabled device. Each reading is numbered (persisted per device) and saved to the SQLite outbox before publishing. Committed readings survive a gateway crash or a broker outage. The publishing loop drains the outbox in order as Sparkplug B (NBIRTH/DBIRTH/DDATA/DDEATH, Rebirth, historical replay) and marks a row sent only after the broker's acknowledgement.
   - After 3 failed polls a device is reported offline (DDEATH); the next good poll brings it back (DBIRTH).
   - Devices added, changed or removed in the registry apply within about 10 seconds; a changed metric list triggers a new DBIRTH.
+  - Startup also reconciles saved device state: disabled/deleted devices get a DDEATH after any queued readings replay. An initial saved DBIRTH can still appear before that replay finishes.
   - If the configuration service is down, it keeps polling from its cached device list.
 
 ## Reading registers
@@ -85,8 +86,9 @@ In MQTTX, connect to `127.0.0.1:8883` with TLS, trust `broker/certs/broker.crt`,
 - **Automatic reconnect:** the gateway retries Mosquitto with backoff (2 s doubling to 30 s), then sends a new NBIRTH and a DBIRTH per online device.
 - **Data restored after disconnects:** every polled reading is committed to the SQLite outbox first; after a reconnect the backlog is replayed in order, marked `is_historical`, and each row is marked sent only after the broker's acknowledgement.
 - **Source timestamps:** a reading carries the time the poll request was sent, and keeps it through buffering and replay.
+- **Storage failures:** the affected poller pauses and retries the same sample or offline event every second. Storage errors do not count as device failures. One pending sample stays in memory; stopping before it can be saved logs a warning, and that sample will be lost.
 - **Data quality:** each value is Good, Bad or Stale, using the Sparkplug `Quality` metric property (192, 0, 500); a good value carries no property. A failed poll on an online device produces a sample with every value Bad (a null metric), until the third failure reports the device offline (DDEATH), after which its values count as Stale. A float register holding NaN or infinity is reported Bad on its own.
-- **Graceful shutdown:** SIGTERM (docker stop, Kubernetes, systemd) and Ctrl+C stop polling, let the current publish finish, send NDEATH and disconnect, with a 15-second limit. Nothing is lost if the limit is hit: the outbox is on disk and the broker publishes the NDEATH Will.
+- **Graceful shutdown:** SIGTERM (docker stop, Kubernetes, systemd) and Ctrl+C stop polling, let the current publish finish, send NDEATH and disconnect, with a 15-second limit. Committed readings remain in the outbox if the limit is hit, and the broker publishes the NDEATH Will.
 - **Not bounded yet:** the outbox has no size limit; a long outage grows it until the disk fills.
 
 ## Checks and limits
@@ -95,7 +97,7 @@ In MQTTX, connect to `127.0.0.1:8883` with TLS, trust `broker/certs/broker.crt`,
 dotnet run --project tests/IoT.Checks
 ```
 
-- **Polling gaps:** while the gateway is down, nothing is read (a gap in sampling, not lost messages). Every reading it did poll is already in the SQLite outbox.
+- **Polling gaps:** while the gateway is down, nothing is read. A poller also pauses while its pending sample cannot be saved; readings are durable only after the SQLite commit.
 - **Modbus security:** Modbus has no authentication or encryption; keep devices on an isolated network. The configuration API and Mosquitto have no authentication yet.
 - **Not yet supported:** Modbus RTU (serial), byte-swapped (as opposed to word-swapped) registers, 64-bit values, strings, and Sparkplug metric aliases.
 - **Sparkplug deviations:** data uses QoS 1, and the demo console subscribes with a persistent session.
