@@ -36,7 +36,9 @@ public sealed partial class ComponentManager : IDisposable
 
     public string ConfigurationUrl { get; }
 
-    public ComponentManager(IConfiguration configuration)
+    public ActivityLog Activity { get; }
+
+    public ComponentManager(IConfiguration configuration, ActivityLog activity)
     {
         _workspace = FindWorkspace();
         _state = Path.Combine(_workspace, "logs", "demo", "state");
@@ -47,6 +49,8 @@ public sealed partial class ComponentManager : IDisposable
             [Configuration] = new("EdgeGateway.Configuration", _workspace, logs),
             [Gateway] = new("EdgeGateway.Gateway", _workspace, logs)
         };
+        Activity = activity;
+        _processes[Gateway].Line += activity.FromGateway;
         _processes[Gateway].Line += line =>
         {
             if (PolledPattern().Match(line) is { Success: true } match)
@@ -129,7 +133,9 @@ public sealed partial class ComponentManager : IDisposable
             // A restarted simulator comes back with zeroed registers, like a power-cycled device.
             if (IsFridge(name) && action is "start" or "restart") _world.Reset(name);
             await RefreshContainersAsync();
-            return code == 0 ? $"{name}: {action} done." : throw new InvalidOperationException(output.Trim());
+            if (code != 0) throw new InvalidOperationException(output.Trim());
+            Activity.Add("console", "action", $"{name}: {action} (container).");
+            return $"{name}: {action} done.";
         }
         if (!_processes.TryGetValue(name, out var process)) throw new ArgumentException($"Unknown component {name}.");
         switch (action)
@@ -147,6 +153,7 @@ public sealed partial class ComponentManager : IDisposable
             default:
                 throw new ArgumentException($"Unknown action {action}.");
         }
+        Activity.Add("console", "action", $"{name}: {action}.");
         return $"{name}: {action} done.";
     }
 
@@ -154,7 +161,9 @@ public sealed partial class ComponentManager : IDisposable
     {
         if (!IsFridge(fridge)) throw new ArgumentException($"Unknown fridge {fridge}.");
         if (!IsContainerRunning(fridge)) throw new InvalidOperationException($"Start {fridge} first.");
-        return _world.Apply(fridge, command);
+        var applied = _world.Apply(fridge, command);
+        Activity.Add("console", "physical", applied);
+        return applied;
     }
 
     public void SendToRunningFridges(string command)

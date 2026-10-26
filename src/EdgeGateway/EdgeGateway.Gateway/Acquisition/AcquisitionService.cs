@@ -9,6 +9,19 @@ namespace EdgeGateway.Gateway.Acquisition;
 public sealed class AcquisitionService(DaqSettings settings, ConfigClient config, Outbox outbox)
 {
     private readonly Dictionary<string, (ModbusPoller Poller, CancellationTokenSource Stop, Task Task)> _pollers = [];
+    private readonly object _gate = new();
+    private long? _version;
+    private bool _configReachable = true;
+
+    public PollerStatus[] Statuses()
+    {
+        lock (_gate) return _pollers.Values.Select(item => item.Poller.Status).OrderBy(status => status.DeviceId).ToArray();
+    }
+
+    public (long? Version, bool Reachable) ConfigState
+    {
+        get { lock (_gate) return (_version, _configReachable); }
+    }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -30,16 +43,19 @@ public sealed class AcquisitionService(DaqSettings settings, ConfigClient config
                         ? "Configuration service unreachable and no cached configuration yet. Retrying."
                         : "Configuration service unreachable. Continuing with the current device list.");
                     reachable = false;
+                    lock (_gate) _configReachable = false;
                 }
                 else
                 {
                     if (!reachable) Console.WriteLine("Configuration service reachable again.");
                     reachable = true;
+                    lock (_gate) _configReachable = true;
                     if (fetched.Version != version)
                     {
                         Apply(fetched.Devices, cancellationToken);
                         Console.WriteLine($"Configuration v{fetched.Version}: {fetched.Devices.Length} device(s).");
                         version = fetched.Version;
+                        lock (_gate) _version = version;
                     }
                 }
                 await Task.Delay(TimeSpan.FromSeconds(settings.ConfigRefreshSeconds), cancellationToken);
@@ -53,6 +69,11 @@ public sealed class AcquisitionService(DaqSettings settings, ConfigClient config
     }
 
     private void Apply(DeviceDefinition[] devices, CancellationToken cancellationToken)
+    {
+        lock (_gate) ApplyLocked(devices, cancellationToken);
+    }
+
+    private void ApplyLocked(DeviceDefinition[] devices, CancellationToken cancellationToken)
     {
         var wanted = devices.Where(device => device.Enabled).ToDictionary(device => device.Id);
         foreach (var id in _pollers.Keys.ToArray())

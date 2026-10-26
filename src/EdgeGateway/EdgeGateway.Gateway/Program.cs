@@ -88,8 +88,10 @@ try
                     updatedAt = DateTimeOffset.UtcNow, upstream = connection.State.ToString(),
                     hostOnline = runner.HostOnline,
                     unsent = outbox.CountUnsent(), bdSeq = connection.BirthDeathSequence,
-                    lastPublished = runner.LastPublished
-                });
+                    lastPublished = runner.LastPublished,
+                    config = new { version = acquisition.ConfigState.Version, reachable = acquisition.ConfigState.Reachable },
+                    devices = acquisition.Statuses()
+                }, IoT.Contracts.EdgeTopics.Json);
                 File.WriteAllText(path + ".tmp", json);
                 File.Move(path + ".tmp", path, overwrite: true);
             }

@@ -12,6 +12,7 @@ builder.Configuration.SetBasePath(AppContext.BaseDirectory)
     .AddCommandLine(args);
 builder.WebHost.UseUrls(builder.Configuration["Control:Url"] ?? "http://127.0.0.1:5200");
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
+builder.Services.AddSingleton<ActivityLog>();
 builder.Services.AddSingleton<ComponentManager>();
 builder.Services.AddSingleton<ResilienceScenario>();
 builder.Services.AddSingleton<SparkplugView>();
@@ -51,7 +52,7 @@ app.MapGet("/api/wire/{broker}", (string broker, WireMonitor monitor) =>
 app.MapGet("/api/config/devices", (IHttpClientFactory factory) =>
     Forward(factory, HttpMethod.Get, "/devices"));
 app.MapPost("/api/config/devices", async (HttpContext context, IHttpClientFactory factory) =>
-    await Forward(factory, HttpMethod.Post, "/devices", await new StreamReader(context.Request.Body).ReadToEndAsync()));
+    await Forward(factory, HttpMethod.Post, "/devices", await new StreamReader(context.Request.Body).ReadToEndAsync(), "Device added to the registry"));
 app.MapPost("/api/config/devices/{id}/enabled/{enabled:bool}", async (string id, bool enabled, IHttpClientFactory factory) =>
 {
     try
@@ -63,7 +64,7 @@ app.MapPost("/api/config/devices/{id}/enabled/{enabled:bool}", async (string id,
         var response = await client.PutAsJsonAsync($"{components.ConfigurationUrl}/devices/{id}", device with { Enabled = enabled },
             IoT.Contracts.EdgeTopics.Json);
         return response.IsSuccessStatusCode
-            ? Results.Ok(new { message = $"{id} {(enabled ? "enabled" : "disabled")} in the device registry." })
+            ? Recorded(components.Activity, $"{id} {(enabled ? "enabled" : "disabled")} in the device registry.")
             : Results.StatusCode((int)response.StatusCode);
     }
     catch (Exception error) when (error is HttpRequestException or TaskCanceledException)
@@ -71,10 +72,13 @@ app.MapPost("/api/config/devices/{id}/enabled/{enabled:bool}", async (string id,
         return Results.BadRequest(new { message = "Configuration service is not reachable." });
     }
 });
+app.MapPut("/api/config/devices/{id}", async (string id, HttpContext context, IHttpClientFactory factory) =>
+    await Forward(factory, HttpMethod.Put, $"/devices/{Uri.EscapeDataString(id)}",
+        await new StreamReader(context.Request.Body).ReadToEndAsync(), $"{id}: registry entry updated"));
 app.MapDelete("/api/config/devices/{id}", (string id, IHttpClientFactory factory) =>
-    Forward(factory, HttpMethod.Delete, $"/devices/{id}"));
+    Forward(factory, HttpMethod.Delete, $"/devices/{id}", null, $"{id}: removed from the registry"));
 
-async Task<IResult> Forward(IHttpClientFactory factory, HttpMethod method, string path, string? body = null)
+async Task<IResult> Forward(IHttpClientFactory factory, HttpMethod method, string path, string? body = null, string? activity = null)
 {
     try
     {
@@ -82,6 +86,8 @@ async Task<IResult> Forward(IHttpClientFactory factory, HttpMethod method, strin
         if (body is not null) request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
         var response = await factory.CreateClient("configuration").SendAsync(request);
         var text = await response.Content.ReadAsStringAsync();
+        if (activity is not null) components.Activity.Add("registry", response.IsSuccessStatusCode ? "registry" : "fail",
+            response.IsSuccessStatusCode ? $"{activity}." : $"{activity} rejected: {text}");
         // A 204 must not carry a body, so pass it through as an empty success.
         return response.StatusCode == System.Net.HttpStatusCode.NoContent
             ? Results.Ok(new { message = "Done." })
@@ -93,6 +99,7 @@ async Task<IResult> Forward(IHttpClientFactory factory, HttpMethod method, strin
     }
 }
 app.MapGet("/api/logs/{name}", (string name) => components.Tail(name, 150));
+app.MapGet("/api/activity", () => components.Activity.Recent());
 
 // What a Sparkplug consumer on Mosquitto sees, rebuilt by the console's own subscription (no backend).
 app.MapGet("/api/view/gateways", (SparkplugView view) => view.Gateways());
@@ -125,4 +132,10 @@ static async Task<IResult> Run(Func<Task<string>> action)
     {
         return Results.BadRequest(new { message = error.Message });
     }
+}
+
+static IResult Recorded(ActivityLog activity, string message)
+{
+    activity.Add("registry", "registry", message);
+    return Results.Ok(new { message });
 }

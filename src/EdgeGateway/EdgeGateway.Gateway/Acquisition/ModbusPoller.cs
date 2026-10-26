@@ -7,6 +7,15 @@ using IoT.Contracts;
 
 namespace EdgeGateway.Gateway.Acquisition;
 
+// A snapshot of one device's polling, for operators and the demo console: what is read, what came back, what failed.
+public sealed record PollerStatus(
+    string DeviceId, string State, string Endpoint, string[] Frames, long LastSeq, int Failures,
+    DateTimeOffset? LastPollAt, DateTimeOffset? LastSuccessAt, string? LastError, RawFrame[] LastRaw,
+    Dictionary<string, MetricValue> LastValues);
+
+// The raw words (or bits) of one frame as the device returned them, before decoding.
+public sealed record RawFrame(string Register, int Start, int[] Values);
+
 // Polls one Modbus TCP device on its configured interval and commits each reading straight to the outbox,
 // so a reading survives a gateway crash from the moment it is polled. After repeated failures it reports
 // the device offline once; the next good poll brings it back.
@@ -16,6 +25,18 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
     private readonly ModbusFrame[] _frames = ModbusFrames.Plan(device.Metrics);
     private int _failures;
     private bool? _online;
+    private List<RawFrame> _raw = [];
+    private volatile PollerStatus? _status;
+
+    // "connecting" until the first poll, then "polling", "failing" (errors, still counted online), or "offline".
+    public PollerStatus Status => _status ??= Snapshot("connecting", 0, null, null, null, [], []);
+    public string DeviceId => device.Id;
+
+    private PollerStatus Snapshot(string state, long seq, DateTimeOffset? pollAt, DateTimeOffset? successAt, string? error,
+        RawFrame[] raw, Dictionary<string, MetricValue> values) =>
+        new(device.Id, state, $"{device.Host}:{device.Port} unit {device.UnitId}",
+            _frames.Select(frame => $"{frame.Register} {frame.Start}+{frame.Count}").ToArray(),
+            seq, _failures, pollAt, successAt, error, raw, values);
 
     public Task RunAsync(CancellationToken cancellationToken) => Task.Factory.StartNew(() => Run(cancellationToken),
         cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
@@ -44,6 +65,7 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
                 if (_online != true) Console.WriteLine($"{device.Id} online.");
                 _online = true;
                 _failures = 0;
+                _status = Snapshot("polling", (long)reading.DeviceSeq, sampledAt, sampledAt, null, _raw.ToArray(), metrics);
                 Console.WriteLine($"Polled {device.Id} #{reading.DeviceSeq}: " + string.Join(", ", metrics.Select(metric =>
                     $"{metric.Key}={metric.Value.Number?.ToString(CultureInfo.InvariantCulture) ?? metric.Value.Quality}")));
             }
@@ -63,6 +85,10 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
                     outbox.AcceptDeviceOffline(device.Id);
                     Console.WriteLine($"{device.Id} offline after {_failures} failed polls.");
                 }
+                // Keep the last good values and raw frames visible; the error says why they are not current.
+                var previous = Status;
+                _status = Snapshot(_online == false ? "offline" : "failing", previous.LastSeq, sampledAt, previous.LastSuccessAt,
+                    $"{error.GetType().Name}: {error.Message}", previous.LastRaw, previous.LastValues);
             }
             var wait = interval - (DateTime.UtcNow - started);
             if (wait > TimeSpan.Zero) cancellationToken.WaitHandle.WaitOne(wait);
@@ -73,6 +99,7 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
     private Dictionary<string, MetricValue> Read(ModbusTcpClient client)
     {
         var metrics = new Dictionary<string, MetricValue>(StringComparer.Ordinal);
+        var raw = new List<RawFrame>();
         int unit = device.UnitId;
         foreach (var frame in _frames)
         {
@@ -81,6 +108,8 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
                 var bits = frame.Register == "coil"
                     ? client.ReadCoils(unit, frame.Start, frame.Count).ToArray()
                     : client.ReadDiscreteInputs(unit, frame.Start, frame.Count).ToArray();
+                raw.Add(new(frame.Register, frame.Start,
+                    Enumerable.Range(0, frame.Count).Select(index => (int)ModbusFrames.DecodeBit(bits, index)).ToArray()));
                 foreach (var metric in frame.Metrics)
                     metrics[metric.Name] = new(Number: ModbusFrames.DecodeBit(bits, metric.Address - frame.Start) * metric.Scale);
                 continue;
@@ -88,6 +117,7 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
             var words = frame.Register == "holding"
                 ? client.ReadHoldingRegisters<ushort>(unit, frame.Start, frame.Count).ToArray()
                 : client.ReadInputRegisters<ushort>(unit, frame.Start, frame.Count).ToArray();
+            raw.Add(new(frame.Register, frame.Start, words.Select(word => (int)word).ToArray()));
             foreach (var metric in frame.Metrics)
             {
                 var value = ModbusFrames.Decode(words.AsSpan(metric.Address - frame.Start, metric.Width), metric.Type, metric.Order);
@@ -99,6 +129,7 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
         }
         // The GPIO pin is configuration, published with the readings so consumers know which input it is.
         if (device.GpioPin is { } pin) metrics["GpioPin"] = new(Number: pin);
+        _raw = raw;
         return metrics;
     }
 
