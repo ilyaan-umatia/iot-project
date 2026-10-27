@@ -73,6 +73,19 @@ public sealed class Outbox : IDisposable
         return true;
     }
 
+    // Includes devices saved by a previous process, even when no poller exists in this one yet.
+    public string[] GetIntakeOnlineDeviceIds()
+    {
+        lock (_gate)
+        {
+            using var command = Command("SELECT DeviceId FROM Devices WHERE IntakeOnline = 1 ORDER BY DeviceId");
+            using var reader = command.ExecuteReader();
+            var ids = new List<string>();
+            while (reader.Read()) ids.Add(reader.GetString(0));
+            return ids.ToArray();
+        }
+    }
+
     // Returns false when the device was already offline.
     public bool AcceptDeviceOffline(string deviceId)
     {

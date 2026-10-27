@@ -8,6 +8,11 @@ using EdgeGateway.Gateway.Configuration;
 using FluentModbus;
 using Google.Protobuf;
 using IoT.Contracts;
+using Microsoft.Data.Sqlite;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 
 internal static class ModbusChecks
 {
@@ -18,6 +23,8 @@ internal static class ModbusChecks
         CheckFrames();
         CheckQuality();
         await CheckPollerAsync();
+        await CheckStorageRecoveryAsync();
+        await CheckConfigurationReconciliationAsync();
         Console.WriteLine("PASS: Device registry, DBIRTH on metric change, read frames, int16/uint16/int32/uint32/float32 decoding with word order, Good/Bad/Stale quality through Sparkplug, Modbus polling into the outbox with request-time stamps, Bad samples and offline detection.");
     }
 
@@ -138,7 +145,8 @@ internal static class ModbusChecks
             ]
         };
         var startedAt = DateTimeOffset.UtcNow.AddMilliseconds(-1);
-        var polling = new ModbusPoller(device, settings, outbox).RunAsync(stop.Token);
+        var poller = new ModbusPoller(device, settings, outbox);
+        var polling = poller.RunAsync(stop.Token);
         try
         {
             var deadline = DateTime.UtcNow.AddSeconds(10);
@@ -151,6 +159,13 @@ internal static class ModbusChecks
                   && reading.Metrics["GpioValue"].Number == 1 && reading.Metrics["GpioPin"].Number == 17,
                 "Registers were not read, decoded and scaled correctly: " + string.Join(", ",
                     reading?.Metrics.Select(metric => $"{metric.Key}={metric.Value.Number}") ?? []));
+            while (poller.Status.State != "polling" && DateTime.UtcNow < deadline) await Task.Delay(10);
+            var goodStatus = poller.Status;
+            Check(goodStatus is { State: "polling", Failures: 0, LastError: null, LastSeq: 1 }
+                && goodStatus.LastPollAt == reading!.Timestamp && goodStatus.LastSuccessAt == reading.Timestamp
+                && goodStatus.LastRaw.Any(frame => frame.Register == "holding" && frame.Values[0] == 65511)
+                && goodStatus.LastValues["Temperature"].Number == -2.5,
+                "Successful polling lost the demo's raw values, timestamps or diagnostic state.");
             server.Stop();
             while (!outbox.PeekUnsent(100).Any(row => row.Kind == "DDEATH") && DateTime.UtcNow < deadline) await Task.Delay(100);
             var after = outbox.PeekUnsent(100);
@@ -160,8 +175,12 @@ internal static class ModbusChecks
             Check(badSamples.Length == settings.FailedPollsBeforeOffline - 1 && badSamples.All(row => row.Reading!.Metrics["GpioPin"].Number == 17),
                 $"Expected {settings.FailedPollsBeforeOffline - 1} Bad samples before DDEATH, got {badSamples.Length}.");
             Check(reading!.Timestamp >= startedAt && reading.Timestamp <= rows[0].CreatedAt.AddMilliseconds(1), "The reading was not stamped at request time.");
-
-
+            while (poller.Status.State != "offline" && DateTime.UtcNow < deadline) await Task.Delay(10);
+            var failedStatus = poller.Status;
+            Check(failedStatus.State == "offline" && failedStatus.Failures >= 3 && failedStatus.LastError is not null
+                && failedStatus.LastSuccessAt == goodStatus.LastSuccessAt && failedStatus.LastRaw == goodStatus.LastRaw
+                && failedStatus.LastValues == goodStatus.LastValues,
+                "Failure diagnostics did not retain the last good values or report the device offline.");
         }
         finally
         {
@@ -171,7 +190,280 @@ internal static class ModbusChecks
         }
     }
 
-    // Values as a sensor would leave them: -2.5 Â°C, 65.0 %, 85.5 W, 70000 door openings, door open.
+    private static async Task CheckStorageRecoveryAsync()
+    {
+        var state = Path.Combine(Path.GetTempPath(), "daq-storage-check-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(state);
+        try
+        {
+            var port = FreePort();
+            using var server = new ModbusTcpServer();
+            server.Start(new IPEndPoint(IPAddress.Loopback, port));
+            SetSensorValues(server);
+            var database = Path.Combine(state, "outbox.db");
+            using var outbox = new Outbox(database);
+            using var probe = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = database, Pooling = false }.ToString());
+            probe.Open();
+            using var stop = new CancellationTokenSource();
+            var settings = new DaqSettings { StateDirectory = state, FailedPollsBeforeOffline = 3 };
+            var poller = new ModbusPoller(Fridge("blocked", port), settings, outbox);
+            var polling = poller.RunAsync(stop.Token);
+            var other = new ModbusPoller(Fridge("other", port), settings, outbox).RunAsync(stop.Token);
+            OutboxRow[] Rows(string id) => outbox.PeekUnsent(1000).Where(row => row.DeviceId == id).ToArray();
+            ulong SavedSequence() => Rows("blocked").Max(row => row.Reading?.DeviceSeq ?? 0);
+            ulong AllocatedSequence() => ulong.Parse(File.ReadAllText(Path.Combine(state, "sequences", "blocked.seq")));
+            void Execute(string sql) { using var command = probe.CreateCommand(); command.CommandText = sql; command.ExecuteNonQuery(); }
+            void Fail(string name, string condition) => Execute($"CREATE TRIGGER {name} BEFORE INSERT ON Outbox WHEN NEW.DeviceId = 'blocked' AND ({condition}) BEGIN SELECT RAISE(ABORT, 'test storage unavailable'); END;");
+            async Task WaitFor(Func<bool> condition, string reason)
+            {
+                var deadline = DateTime.UtcNow.AddSeconds(20);
+                while (!condition() && DateTime.UtcNow < deadline)
+                {
+                    Check(!polling.IsCompleted && !other.IsCompleted, "A poller stopped unexpectedly: " + polling.Exception);
+                    await Task.Delay(50);
+                }
+                Check(condition(), reason);
+            }
+            try
+            {
+                await WaitFor(() => Rows("blocked").Length > 0 && Rows("other").Length > 0, "Pollers did not start.");
+                Fail("FailReading", "1");
+                await WaitFor(() => AllocatedSequence() > SavedSequence(), "Storage failure was not exercised.");
+                var pending = AllocatedSequence();
+                var otherCount = Rows("other").Length;
+                await Task.Delay(3200); // More than the device failure threshold, with storage still unavailable.
+                Check(!polling.IsCompleted && AllocatedSequence() == pending, "Storage retries faulted the poller or allocated extra sequences.");
+                Check(Rows("other").Length > otherCount, "One device's storage retry blocked another poller.");
+                Check(Rows("blocked").All(row => row.Kind != "DDEATH" && row.Reading!.Metrics["Temperature"].IsGood),
+                    "A storage failure was counted as a device failure.");
+                Check(poller.Status is { State: "polling", Failures: 0, LastError: null },
+                    "Storage errors were incorrectly shown as Modbus failures in demo diagnostics.");
+                var changedAt = DateTimeOffset.UtcNow;
+                server.GetHoldingRegisters(1).SetBigEndian<short>(0, 120);
+                Execute("DROP TRIGGER FailReading");
+                await WaitFor(() => SavedSequence() > pending, "Polling did not recover after storage became available.");
+                var recovered = Rows("blocked").Single(row => row.Reading?.DeviceSeq == pending).Reading!;
+                Check(recovered.Metrics["Temperature"].Number == -2.5 && recovered.Timestamp < changedAt,
+                    "Retry changed the pending sample's values or timestamp.");
+                Check(Rows("blocked").Last().Reading!.Metrics["Temperature"].Number == 12,
+                    "Fresh polling did not resume after saving the pending sample.");
+
+                // The persistent device sequence can also fail independently of SQLite.
+                using (var locked = new FileStream(Path.Combine(state, "sequences", "blocked.seq.tmp"), FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+                {
+                    await Task.Delay(1500);
+                    var count = Rows("blocked").Length;
+                    await Task.Delay(2200);
+                    Check(!polling.IsCompleted && Rows("blocked").Length == count, "Sequence-file failure was not retried before the next poll.");
+                    Check(Rows("blocked").All(row => row.Kind != "DDEATH" && row.Reading!.Metrics["Temperature"].IsGood),
+                        "Sequence-file failure produced a Bad sample or DDEATH.");
+                }
+                var beforeResume = SavedSequence();
+                await WaitFor(() => SavedSequence() > beforeResume, "Sequence-file recovery did not resume polling.");
+
+                // Failed saves of a genuine Bad sample and offline event must also remain retryable.
+                Fail("FailBad", "NEW.Kind = 'DDATA' AND json_extract(NEW.Reading, '$.metrics.Temperature.quality') = 'bad'");
+                Fail("FailDeath", "NEW.Kind = 'DDEATH'");
+                server.Stop();
+                await WaitFor(() => AllocatedSequence() > SavedSequence(), "Bad-sample storage failure was not exercised.");
+                await Task.Delay(1200);
+                Check(!polling.IsCompleted, "Failed saving a Bad sample killed the poller.");
+                Execute("DROP TRIGGER FailBad");
+                await WaitFor(() => Rows("blocked").Count(row => row.Reading?.Metrics["Temperature"].Quality == MetricQuality.Bad) == 2,
+                    "Expected two saved Bad samples before offline detection.");
+                await Task.Delay(2200);
+                Check(!polling.IsCompleted && Rows("blocked").All(row => row.Kind != "DDEATH"),
+                    "Failed saving DDEATH killed the poller or recorded an uncommitted offline state.");
+                Execute("DROP TRIGGER FailDeath");
+                await WaitFor(() => Rows("blocked").Count(row => row.Kind == "DDEATH") == 1, "Offline event was not retried exactly once.");
+                using var restarted = new ModbusTcpServer();
+                restarted.Start(new IPEndPoint(IPAddress.Loopback, port));
+                SetSensorValues(restarted);
+                await WaitFor(() => Rows("blocked").Last() is { Kind: "DBIRTH", Reading: not null }, "Device recovery did not produce DBIRTH.");
+                Check(Rows("blocked").Select(row => row.Reading).OfType<DeviceReading>().Select(reading => reading.DeviceSeq)
+                    .SequenceEqual(Enumerable.Range(1, (int)SavedSequence()).Select(value => (ulong)value)),
+                    "Storage retries duplicated or skipped a saved reading sequence.");
+
+                Fail("FailShutdown", "1");
+                await WaitFor(() => AllocatedSequence() > SavedSequence(), "Shutdown storage failure was not exercised.");
+                stop.Cancel();
+                await Task.WhenAll(polling, other).WaitAsync(TimeSpan.FromSeconds(3));
+                Check(polling.IsCompletedSuccessfully && Rows("blocked").Count(row => row.Kind == "DDEATH") == 1,
+                    "Cancellation during storage failure faulted the poller or added a false DDEATH.");
+                using var integrity = probe.CreateCommand();
+                integrity.CommandText = "PRAGMA integrity_check";
+                Check((string?)integrity.ExecuteScalar() == "ok", "Outbox integrity check failed after retries.");
+            }
+            finally
+            {
+                stop.Cancel();
+                await Task.WhenAll(polling, other).WaitAsync(TimeSpan.FromSeconds(5));
+            }
+        }
+        finally { Directory.Delete(state, recursive: true); }
+        Console.WriteLine("PASS: SQLite and sequence-file failure recovery, unchanged pending samples, independent pollers, Bad-sample/offline retries and cancellation during storage failure.");
+    }
+
+    private static async Task CheckConfigurationReconciliationAsync()
+    {
+        var state = Path.Combine(Path.GetTempPath(), "daq-config-check-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(state);
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        await using var api = builder.Build();
+        var configUrl = $"http://127.0.0.1:{FreePort()}";
+        api.Urls.Add(configUrl);
+        GatewayConfiguration? snapshot = null;
+        api.MapGet("/config", () => Volatile.Read(ref snapshot) is { } value ? Results.Ok(value) : Results.StatusCode(503));
+        await api.StartAsync();
+        try
+        {
+            using var server = new ModbusTcpServer();
+            var port = FreePort();
+            server.Start(new IPEndPoint(IPAddress.Loopback, port));
+            SetSensorValues(server);
+            var database = Path.Combine(state, "outbox.db");
+            using var outbox = new Outbox(database);
+            using var probe = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = database, Pooling = false }.ToString());
+            probe.Open();
+            var settings = new DaqSettings { ConfigUrl = configUrl, StateDirectory = state, ConfigRefreshSeconds = 1 };
+            using var client = new ConfigClient(settings);
+            var keep = Fridge("keep", port);
+            OutboxRow[] Rows(string id) => outbox.PeekUnsent(1000).Where(row => row.DeviceId == id).ToArray();
+            void Sql(string sql) { using var command = probe.CreateCommand(); command.CommandText = sql; command.ExecuteNonQuery(); }
+            long Deaths(string id)
+            {
+                using var command = probe.CreateCommand();
+                command.CommandText = "SELECT COUNT(*) FROM Outbox WHERE DeviceId = $id AND Kind = 'DDEATH'";
+                command.Parameters.AddWithValue("$id", id);
+                return (long)command.ExecuteScalar()!;
+            }
+            DeviceReading Seed(string id, bool published)
+            {
+                var reading = SparkplugPayloads.FridgeReading(id, 1, DateTimeOffset.UtcNow.AddMinutes(-1), 4.5, 65, 17, 0);
+                outbox.AcceptReading(reading);
+                if (published) outbox.MarkSent(Rows(id).Single());
+                return reading;
+            }
+            async Task WaitFor(Func<bool> condition, Task task, string reason)
+            {
+                var deadline = DateTime.UtcNow.AddSeconds(15);
+                while (!condition() && DateTime.UtcNow < deadline)
+                {
+                    Check(!task.IsCompleted, "Acquisition stopped unexpectedly: " + task.Exception);
+                    await Task.Delay(50);
+                }
+                Check(condition(), reason);
+            }
+            AcquisitionService? acquisition = null;
+            async Task Run(Func<Task, Task> checks)
+            {
+                using var stop = new CancellationTokenSource();
+                acquisition = new AcquisitionService(settings, client, outbox);
+                var task = acquisition.RunAsync(stop.Token);
+                try { await checks(task); }
+                finally
+                {
+                    stop.Cancel();
+                    try { await task.WaitAsync(TimeSpan.FromSeconds(5)); }
+                    catch (OperationCanceledException) { }
+                }
+            }
+
+            var disabled = Seed("disabled", published: true) with { DeviceSeq = 2, Timestamp = DateTimeOffset.UtcNow.AddSeconds(-10) };
+            outbox.AcceptReading(disabled);
+            Seed("deleted", published: true);
+            Seed("unpublished", published: false);
+            Seed("already-offline", published: true);
+            outbox.AcceptDeviceOffline("already-offline");
+            // An unavailable API with no cache is not an empty enabled-device list.
+            await Run(async task =>
+            {
+                await Task.Delay(1300);
+                Check(Deaths("disabled") == 0 && Deaths("deleted") == 0, "Missing configuration incorrectly disabled saved devices.");
+                Volatile.Write(ref snapshot, new(1, [keep]));
+                await WaitFor(() => Deaths("disabled") == 1 && Deaths("deleted") == 1 && Rows("keep").Length > 0,
+                    task, "Startup did not reconcile persisted devices while starting enabled ones.");
+                Check(Rows("disabled").Select(row => row.Kind).SequenceEqual(["DDATA", "DDEATH"])
+                    && Rows("disabled")[0].Reading is { } retained && retained.DeviceSeq == disabled.DeviceSeq
+                    && retained.Timestamp == disabled.Timestamp && retained.Metrics.OrderBy(item => item.Key).SequenceEqual(disabled.Metrics.OrderBy(item => item.Key)),
+                    "Reconciliation changed/dropped the saved reading or reordered its DDEATH.");
+                Check(Rows("unpublished").Select(row => row.Kind).SequenceEqual(["DBIRTH", "DDEATH"])
+                    && Deaths("already-offline") == 1, "Never-published births or pending deaths were mishandled.");
+                Check(outbox.GetPublishedOnlineDevices().Any(reading => reading.DeviceId == "disabled"),
+                    "Reconciliation overwrote broker-acknowledged state before replay.");
+                foreach (var row in outbox.PeekUnsent(1000).Where(row => row.DeviceId != "keep")) outbox.MarkSent(row);
+                Check(outbox.GetPublishedOnlineDevices().All(reading => reading.DeviceId == "keep"), "Replayed DDEATH did not clear published state.");
+
+                Seed("storage", published: true);
+                Sql("CREATE TRIGGER FailReconcile BEFORE INSERT ON Outbox WHEN NEW.DeviceId = 'storage' AND NEW.Kind = 'DDEATH' BEGIN SELECT RAISE(ABORT, 'test reconciliation storage failure'); END;");
+                Volatile.Write(ref snapshot, new(2, [keep]));
+                var otherCount = Rows("keep").Length;
+                await Task.Delay(2300);
+                Check(!task.IsCompleted && Deaths("storage") == 0 && outbox.GetIntakeOnlineDeviceIds().Contains("storage")
+                    && Rows("keep").Length > otherCount, "Failed reconciliation committed partial state or stopped unaffected polling.");
+                Sql("DROP TRIGGER FailReconcile");
+                await WaitFor(() => Deaths("storage") == 1, task, "Failed configuration version was not retried after storage recovery.");
+                Volatile.Write(ref snapshot, null);
+                var beforeOutage = Rows("keep").Length;
+                await WaitFor(() => Rows("keep").Length > beforeOutage, task, "API outage stopped existing polling.");
+            });
+            // Fresh acquisition process state, API down: the last valid cached configuration still applies.
+            await Run(async task =>
+            {
+                var beforeCache = Rows("keep").Length;
+                await WaitFor(() => Rows("keep").Length > beforeCache, task, "Cached startup did not resume enabled polling.");
+                Check(Deaths("disabled") == 1 && Deaths("deleted") == 1 && Deaths("storage") == 1, "Restart duplicated offline transitions.");
+                Volatile.Write(ref snapshot, new(3, []));
+                await WaitFor(() => Deaths("keep") == 1, task, "A valid empty registry did not stop the active device.");
+                var afterDisable = Rows("keep").Length;
+                await Task.Delay(1300);
+                Check(Rows("keep").Length == afterDisable && outbox.GetIntakeOnlineDeviceIds().Length == 0,
+                    "A late poll resurrected the disabled device.");
+                Volatile.Write(ref snapshot, new(4, [keep]));
+                await WaitFor(() => Rows("keep").Last() is { Kind: "DBIRTH" }, task, "Re-enable did not queue a new birth after the pending death.");
+            });
+            Volatile.Write(ref snapshot, new(5, []));
+            await Run(async task => await WaitFor(() => Deaths("keep") == 2, task, "Restart with empty config failed to reconcile the re-enabled device."));
+            await Run(async task =>
+            {
+                await Task.Delay(1200);
+                Check(!task.IsCompleted && Deaths("keep") == 2, "Repeated empty config/restart duplicated DDEATH.");
+            });
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var requests = 0;
+            server.RequestValidator = (_, _, _, _) =>
+            {
+                entered.TrySetResult();
+                Interlocked.Increment(ref requests);
+                Thread.Sleep(1200); // Each request succeeds, but six frames exceed the old five-second stop wait.
+                return ModbusExceptionCode.OK;
+            };
+            var slow = keep with { Id = "slow", Metrics = Enumerable.Range(0, 5)
+                .Select(i => new MetricDefinition("M" + i, "holding", (ushort)(i * 20), 1, ""))
+                .Append(new("Door", "coil", 0, 1, "")).ToArray() };
+            Volatile.Write(ref snapshot, new(6, [slow]));
+            await Run(async task =>
+            {
+                await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                Volatile.Write(ref snapshot, new(7, []));
+                await Task.Delay(1300); // Apply is now waiting for the slow in-flight poll.
+                var statuses = await Task.Run(() => acquisition!.Statuses()).WaitAsync(TimeSpan.FromSeconds(1));
+                Check(statuses.Any(status => status.DeviceId == "slow") && acquisition!.ConfigState.Version == 6,
+                    "In-flight configuration changes blocked diagnostics or reported the new version too early.");
+                await WaitFor(() => Deaths("slow") == 1, task, "Disable did not wait for the complete in-flight sample.");
+                Check(requests == 6 && Rows("slow").Select(row => row.Kind).SequenceEqual(["DBIRTH", "DDEATH"])
+                    && !outbox.GetIntakeOnlineDeviceIds().Contains("slow"), "A slow poll was dropped or resurrected the disabled device.");
+            });
+            using var integrity = probe.CreateCommand();
+            integrity.CommandText = "PRAGMA integrity_check";
+            Check((string?)integrity.ExecuteScalar() == "ok", "Outbox integrity failed after reconciliation.");
+        }
+        finally { await api.StopAsync(); Directory.Delete(state, recursive: true); }
+        Console.WriteLine("PASS: Persisted device reconciliation, disabled/deleted/empty configuration, ordered backlog, pending deaths, SQLite rollback/retry, unaffected polling, cached restart, re-enable and slow in-flight polls.");
+    }
+
+    // Sensor registers: -2.5 C, 65%, 85.5 W, 70000 door openings, door open.
     private static void SetSensorValues(ModbusTcpServer server)
     {
         server.AddUnit(1);

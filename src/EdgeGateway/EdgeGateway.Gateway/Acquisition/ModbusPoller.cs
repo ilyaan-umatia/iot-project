@@ -4,6 +4,7 @@ using EdgeGateway.Gateway.Configuration;
 using EdgeGateway.Gateway.Storage;
 using FluentModbus;
 using IoT.Contracts;
+using Microsoft.Data.Sqlite;
 
 namespace EdgeGateway.Gateway.Acquisition;
 
@@ -17,7 +18,7 @@ public sealed record PollerStatus(
 public sealed record RawFrame(string Register, int Start, int[] Values);
 
 // Polls one Modbus TCP device on its configured interval and commits each reading straight to the outbox,
-// so a reading survives a gateway crash from the moment it is polled. After repeated failures it reports
+// so a reading survives a gateway crash once committed. After repeated device failures it reports
 // the device offline once; the next good poll brings it back.
 public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, Outbox outbox)
 {
@@ -52,6 +53,7 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
             var started = DateTime.UtcNow;
             // The source timestamp is when the device was asked, not when the reply was processed or published.
             var sampledAt = DateTimeOffset.UtcNow;
+            Dictionary<string, MetricValue>? metrics = null;
             try
             {
                 if (!client.IsConnected)
@@ -59,15 +61,7 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
                     client.Connect(new IPEndPoint(Resolve(device.Host), device.Port), ModbusEndianness.BigEndian);
                     sampledAt = DateTimeOffset.UtcNow;
                 }
-                var metrics = Read(client);
-                var reading = new DeviceReading(device.Id, _sequence.Next(), sampledAt, metrics);
-                outbox.AcceptReading(reading);
-                if (_online != true) Console.WriteLine($"{device.Id} online.");
-                _online = true;
-                _failures = 0;
-                _status = Snapshot("polling", (long)reading.DeviceSeq, sampledAt, sampledAt, null, _raw.ToArray(), metrics);
-                Console.WriteLine($"Polled {device.Id} #{reading.DeviceSeq}: " + string.Join(", ", metrics.Select(metric =>
-                    $"{metric.Key}={metric.Value.Number?.ToString(CultureInfo.InvariantCulture) ?? metric.Value.Quality}")));
+                metrics = Read(client);
             }
             catch (Exception error)
             {
@@ -75,23 +69,66 @@ public sealed class ModbusPoller(DeviceDefinition device, DaqSettings settings, 
                 if (cancellationToken.IsCancellationRequested) break; // stopping mid-poll is not a device failure
                 _failures++;
                 Console.WriteLine($"Poll {device.Id} failed ({error.GetType().Name}: {error.Message}), {_failures} in a row.");
-                // Until the device is declared offline, each failed poll is still a sample: every value at Bad quality,
-                // so consumers see the problem immediately instead of an old value that looks current.
-                if (_online == true && _failures < settings.FailedPollsBeforeOffline)
-                    outbox.AcceptReading(new DeviceReading(device.Id, _sequence.Next(), sampledAt, BadSample()));
-                if (_failures >= settings.FailedPollsBeforeOffline && _online != false)
-                {
-                    _online = false;
-                    outbox.AcceptDeviceOffline(device.Id);
-                    Console.WriteLine($"{device.Id} offline after {_failures} failed polls.");
-                }
                 // Keep the last good values and raw frames visible; the error says why they are not current.
                 var previous = Status;
                 _status = Snapshot(_online == false ? "offline" : "failing", previous.LastSeq, sampledAt, previous.LastSuccessAt,
                     $"{error.GetType().Name}: {error.Message}", previous.LastRaw, previous.LastValues);
             }
+            // Storage errors must not count as device failures. Finish saving this sample before polling again.
+            if (metrics is not null)
+            {
+                _failures = 0;
+                var reading = SaveReading(metrics, sampledAt, cancellationToken);
+                if (reading is null) break;
+                if (_online != true) Console.WriteLine($"{device.Id} online.");
+                _online = true;
+                _status = Snapshot("polling", (long)reading.DeviceSeq, sampledAt, sampledAt, null, _raw.ToArray(), metrics);
+            }
+            else if (_online == true && _failures < settings.FailedPollsBeforeOffline)
+            {
+                if (SaveReading(BadSample(), sampledAt, cancellationToken) is null) break;
+            }
+            else if (_failures >= settings.FailedPollsBeforeOffline && _online != false)
+            {
+                if (!SaveWithRetry(() => outbox.AcceptDeviceOffline(device.Id), "offline event", cancellationToken)) break;
+                _online = false;
+                var previous = Status;
+                _status = Snapshot("offline", previous.LastSeq, sampledAt, previous.LastSuccessAt,
+                    previous.LastError, previous.LastRaw, previous.LastValues);
+                Console.WriteLine($"{device.Id} offline after {_failures} failed polls.");
+            }
             var wait = interval - (DateTime.UtcNow - started);
             if (wait > TimeSpan.Zero) cancellationToken.WaitHandle.WaitOne(wait);
+        }
+    }
+
+    private DeviceReading? SaveReading(Dictionary<string, MetricValue> metrics, DateTimeOffset sampledAt, CancellationToken cancellationToken)
+    {
+        DeviceReading? reading = null;
+        var saved = SaveWithRetry(() =>
+        {
+            // Allocate once: an outbox retry keeps the same sequence, values and source timestamp.
+            reading ??= new(device.Id, _sequence.Next(), sampledAt, metrics);
+            outbox.AcceptReading(reading);
+        }, "reading", cancellationToken);
+        if (saved)
+            Console.WriteLine($"Polled {device.Id} #{reading!.DeviceSeq}: " + string.Join(", ", metrics.Select(metric =>
+                $"{metric.Key}={metric.Value.Number?.ToString(CultureInfo.InvariantCulture) ?? metric.Value.Quality}")));
+        return saved ? reading : null;
+    }
+
+    private bool SaveWithRetry(Action save, string pending, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            try { save(); return true; }
+            catch (Exception error) when (error is SqliteException or IOException or UnauthorizedAccessException)
+            {
+                Console.WriteLine($"Storage failed for {device.Id} {pending} ({error.GetType().Name}: {error.Message}). Retrying in 1s; polling paused.");
+                if (!cancellationToken.WaitHandle.WaitOne(TimeSpan.FromSeconds(1))) continue;
+                Console.WriteLine($"Stopped with an uncommitted {pending} for {device.Id}; storage is unavailable.");
+                return false;
+            }
         }
     }
 
