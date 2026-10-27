@@ -200,7 +200,7 @@ public sealed class GatewayRunner(MqttConnection connection, Outbox outbox, Gate
         Console.WriteLine($"Published NBIRTH: {topic} (bdSeq {connection.BirthDeathSequence})");
     }
 
-    // Births describe what the backend last received, so the following backlog continues from there.
+    // Births describe the last broker-acknowledged state, before replaying the remaining backlog.
     private async Task PublishDeviceBirthsAsync(SparkplugSequence sequence, CancellationToken cancellationToken)
     {
         foreach (var reading in outbox.GetPublishedOnlineDevices())

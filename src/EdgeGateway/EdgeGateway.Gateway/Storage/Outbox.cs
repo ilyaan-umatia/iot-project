@@ -6,7 +6,7 @@ namespace EdgeGateway.Gateway.Storage;
 
 public sealed record OutboxRow(long Id, string Kind, string DeviceId, DeviceReading? Reading, DateTimeOffset CreatedAt);
 
-// Every device message is committed here before it is acknowledged, and leaves only after the broker's PUBACK.
+// Polled readings are committed before publishing and marked sent only after the broker's PUBACK.
 public sealed class Outbox : IDisposable
 {
     private readonly SqliteConnection _connection;
@@ -47,7 +47,7 @@ public sealed class Outbox : IDisposable
             Execute("ALTER TABLE Devices ADD COLUMN MetricSignature TEXT");
     }
 
-    // Returns false for a reading the edge broker redelivered.
+    // Returns false if this device's reading number is already stored.
     public bool AcceptReading(DeviceReading reading)
     {
         lock (_gate)
@@ -121,7 +121,7 @@ public sealed class Outbox : IDisposable
         }
     }
 
-    // Also records what the backend now knows, so a new session can rebirth exactly those devices.
+    // Records the last broker-acknowledged device state for births in the next MQTT session.
     public void MarkSent(OutboxRow row)
     {
         lock (_gate)
@@ -156,7 +156,7 @@ public sealed class Outbox : IDisposable
         lock (_gate) return (long)Scalar("SELECT COUNT(*) FROM Outbox WHERE SentAt IS NULL")!;
     }
 
-    // Sent rows are kept for a while so late redeliveries from the edge broker are still recognized.
+    // Keep sent rows temporarily so repeated reading numbers are still recognized.
     public void PruneSent(TimeSpan keep)
     {
         lock (_gate)
