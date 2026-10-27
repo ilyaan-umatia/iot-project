@@ -7,24 +7,14 @@ using System.Text.RegularExpressions;
 namespace Demo.Control;
 
 public sealed record ComponentView(string Name, string Kind, bool Running, string Status, string[] Actions);
-public sealed record FridgeView(string Id, bool Running, int Port, int GpioPin, FridgeState Controls, long LastPolled);
-public sealed record FridgeDefinition(string Id, int Port, int GpioPin, double BaseTemperature);
 
 // Starts, stops and crashes every demo component: the configuration service and the gateway
-// as processes; the broker and one Modbus simulator per fridge as containers.
+// as processes, and the Mosquitto broker as a container. Devices are external (registered in the configuration service).
 public sealed partial class ComponentManager : IDisposable
 {
     public const string Configuration = "configuration", Gateway = "gateway",
         Broker = "mosquitto";
-    public static readonly FridgeDefinition[] Fridges =
-    [
-        new("fridge-01", 5021, 17, 4.5), new("fridge-02", 5022, 18, 3.5), new("fridge-03", 5023, 27, 5.5)
-    ];
-    private static readonly Dictionary<string, string> Containers = new Dictionary<string, string>
-    {
-        [Broker] = "dotnet-mqtt-demo-mosquitto-1"
-    }.Concat(Fridges.Select(fridge => KeyValuePair.Create(fridge.Id, $"dotnet-mqtt-demo-{fridge.Id}-1")))
-     .ToDictionary(item => item.Key, item => item.Value);
+    private static readonly Dictionary<string, string> Containers = new() { [Broker] = "dotnet-mqtt-demo-mosquitto-1" };
 
     private readonly string _workspace;
     private readonly string _state;
@@ -32,7 +22,6 @@ public sealed partial class ComponentManager : IDisposable
     private readonly Dictionary<string, string> _containerStatus = Containers.Keys.ToDictionary(name => name, _ => "unknown");
     private readonly ConcurrentDictionary<string, long> _lastPolled = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };
-    private readonly FridgeWorld _world;
 
     public string ConfigurationUrl { get; }
 
@@ -56,22 +45,17 @@ public sealed partial class ComponentManager : IDisposable
             if (PolledPattern().Match(line) is { Success: true } match)
                 _lastPolled[match.Groups[1].Value] = long.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
         };
-        _world = new FridgeWorld(Fridges, IsContainerRunning);
     }
 
-    public static bool IsFridge(string name) => Fridges.Any(fridge => fridge.Id == name);
-    public long LastPolled(string fridge) => _lastPolled.GetValueOrDefault(fridge);
+    public long LastPolled(string device) => _lastPolled.GetValueOrDefault(device);
+    public Dictionary<string, long> PolledSnapshot() => new(_lastPolled);
     public string[] Tail(string name, int count) => _processes.TryGetValue(name, out var process) ? process.Tail(count) : [];
-
-    public FridgeView[] DescribeFridges() => Fridges.Select(fridge => new FridgeView(fridge.Id,
-        IsContainerRunning(fridge.Id), fridge.Port, fridge.GpioPin, _world.State(fridge.Id), LastPolled(fridge.Id))).ToArray();
 
     public ComponentView[] Describe()
     {
         var gateway = ReadGatewayStatus();
         return
         [
-            .. Fridges.Select(fridge => ContainerView(fridge.Id)),
             View(Configuration, null),
             View(Gateway, gateway is null ? null : $"upstream {gateway.Value.GetProperty("upstream").GetString()}"),
             ContainerView(Broker)
@@ -130,8 +114,6 @@ public sealed partial class ComponentManager : IDisposable
                 _ => throw new ArgumentException($"Unknown action {action}.")
             };
             var (code, output) = await RunAsync("docker", [command, container]);
-            // A restarted simulator comes back with zeroed registers, like a power-cycled device.
-            if (IsFridge(name) && action is "start" or "restart") _world.Reset(name);
             await RefreshContainersAsync();
             if (code != 0) throw new InvalidOperationException(output.Trim());
             Activity.Add("console", "action", $"{name}: {action} (container).");
@@ -157,22 +139,7 @@ public sealed partial class ComponentManager : IDisposable
         return $"{name}: {action} done.";
     }
 
-    public string SendFridgeCommand(string fridge, string command)
-    {
-        if (!IsFridge(fridge)) throw new ArgumentException($"Unknown fridge {fridge}.");
-        if (!IsContainerRunning(fridge)) throw new InvalidOperationException($"Start {fridge} first.");
-        var applied = _world.Apply(fridge, command);
-        Activity.Add("console", "physical", applied);
-        return applied;
-    }
-
-    public void SendToRunningFridges(string command)
-    {
-        foreach (var fridge in Fridges)
-            if (IsContainerRunning(fridge.Id)) _world.Apply(fridge.Id, command);
-    }
-
-    // Dependency order: devices and broker, the device registry, then the gateway,
+    // Dependency order: the broker, the device registry, then the gateway,
     // which reads its device list from the registry.
     public async Task StartAllAsync()
     {
@@ -195,7 +162,7 @@ public sealed partial class ComponentManager : IDisposable
         await ActAsync(Configuration, "stop");
     }
 
-    // Fresh broker, simulators and state, so the demo starts at reading #1 with nothing queued.
+    // Fresh broker and state: empty registry, empty outbox, nothing queued.
     public async Task ResetAsync()
     {
         foreach (var process in _processes.Values) process.Crash();
@@ -203,7 +170,6 @@ public sealed partial class ComponentManager : IDisposable
         if (code != 0) throw new InvalidOperationException(output.Trim());
         if (Directory.Exists(_state)) Directory.Delete(_state, recursive: true);
         _lastPolled.Clear();
-        foreach (var fridge in Fridges) _world.Reset(fridge.Id);
         await StartAllAsync();
     }
 
@@ -252,7 +218,6 @@ public sealed partial class ComponentManager : IDisposable
     public void Dispose()
     {
         foreach (var process in _processes.Values) process.Crash();
-        _world.Dispose();
         _http.Dispose();
     }
 }

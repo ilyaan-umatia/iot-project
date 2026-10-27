@@ -8,7 +8,6 @@ public sealed record ScenarioView(bool Running, ScenarioStep[] Steps, string? Re
 public sealed class ResilienceScenario(ComponentManager components, SparkplugView view)
 {
     private readonly object _gate = new();
-    private static readonly string Victim = ComponentManager.Fridges[1].Id;
     private ScenarioStep[] _steps = [];
     private string? _result;
     private bool? _passed;
@@ -36,7 +35,7 @@ public sealed class ResilienceScenario(ComponentManager components, SparkplugVie
     {
         (string Label, string Explanation, Func<Task> Action, int Seconds)[] plan =
         [
-            ("Start everything", "Simulators, broker, registry, publisher and data acquisition in dependency order.",
+            ("Start everything", "Broker, device registry and gateway in dependency order.",
                 components.StartAllAsync, 10),
             ("Crash Mosquitto", "The gateway keeps polling and stores every reading in its SQLite outbox.",
                 () => components.ActAsync(ComponentManager.Broker, "crash"), 15),
@@ -49,14 +48,10 @@ public sealed class ResilienceScenario(ComponentManager components, SparkplugVie
             ("Crash configuration service", "The gateway keeps polling from its cached device list.",
                 () => components.ActAsync(ComponentManager.Configuration, "crash"), 10),
             ("Restart configuration service", "The gateway reconnects to the registry.",
-                () => components.ActAsync(ComponentManager.Configuration, "start"), 10),
-            ($"Crash {Victim} simulator", "Three failed polls become a Sparkplug DDEATH; the other fridges carry on.",
-                () => components.ActAsync(Victim, "crash"), 15),
-            ($"Restart {Victim} simulator", "The next good poll brings a DBIRTH, and numbering continues.",
-                () => components.ActAsync(Victim, "start"), 12)
+                () => components.ActAsync(ComponentManager.Configuration, "start"), 10)
         ];
         lock (_gate) _steps = plan.Select(step => new ScenarioStep(step.Label, step.Explanation, "pending"))
-            .Append(new("Verify", "Compare each fridge's polled readings with what arrived on Mosquitto.", "pending")).ToArray();
+            .Append(new("Verify", "Compare each registered device's polled readings with what arrived on Mosquitto.", "pending")).ToArray();
         try
         {
             for (var index = 0; index < plan.Length; index++)
@@ -68,20 +63,20 @@ public sealed class ResilienceScenario(ComponentManager components, SparkplugVie
             }
             SetStatus(plan.Length, "running");
             // Polling never stops, so take the polled numbers now and give them time to reach Mosquitto.
-            var polledNow = ComponentManager.Fridges.ToDictionary(fridge => fridge.Id, fridge => components.LastPolled(fridge.Id));
+            var polledNow = components.PolledSnapshot();
+            if (polledNow.Count == 0) throw new InvalidOperationException("No device has been polled. Add a device first (Device registry tab).");
             await Task.Delay(TimeSpan.FromSeconds(8));
             var summaries = view.Summaries();
             var passed = true;
             var lines = new List<string>();
-            foreach (var fridge in ComponentManager.Fridges)
+            foreach (var (id, polled) in polledNow.OrderBy(item => item.Key))
             {
-                var polled = polledNow[fridge.Id];
-                var device = summaries.FirstOrDefault(item => item.DeviceId == fridge.Id);
+                var device = summaries.FirstOrDefault(item => item.DeviceId == id);
                 var last = device?.LastSeq ?? 0;
                 var missing = device?.Missing ?? polled;
                 var duplicates = device?.Duplicates ?? 0;
                 passed &= last >= polled && missing == 0 && duplicates == 0;
-                lines.Add($"{fridge.Id}: polled #{polled}, on Mosquitto #{last}, missing {missing}, duplicates {duplicates}, historical {device?.Historical ?? 0}");
+                lines.Add($"{id}: polled #{polled}, on Mosquitto #{last}, missing {missing}, duplicates {duplicates}, historical {device?.Historical ?? 0}");
             }
             SetStatus(plan.Length, passed ? "done" : "failed");
             Finish(passed, string.Join(" · ", lines));

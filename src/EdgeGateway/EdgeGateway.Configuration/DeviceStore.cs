@@ -27,11 +27,6 @@ public sealed class DeviceStore : IDisposable
             """);
     }
 
-    public bool IsEmpty
-    {
-        get { lock (_gate) return Scalar("SELECT COUNT(*) FROM Devices") is 0L; }
-    }
-
     public DeviceDefinition[] All()
     {
         lock (_gate)

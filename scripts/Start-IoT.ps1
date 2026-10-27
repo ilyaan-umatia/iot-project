@@ -1,4 +1,4 @@
-# Runs the edge only, up to Mosquitto: Modbus simulators, configuration service and the gateway.
+# Runs the edge only, up to Mosquitto: configuration service and the gateway. Devices are registered separately.
 # No backend, so the gateway does not wait for a primary host. Watch the data in MQTTX / MQTT Explorer.
 param([switch]$NoBuild)
 
@@ -33,8 +33,8 @@ try {
         if ([DateTime]::UtcNow -gt $deadline) { throw 'Configuration service did not start. Check logs/.' }
         Start-Sleep -Milliseconds 300
     }
-    Write-Output 'Edge running: simulators :5021-5023, configuration http://127.0.0.1:5300, gateway -> Mosquitto :8883. Logs: logs/'
-    Write-Output 'The simulators start with zeroed registers; write values with a Modbus tool or use ./scripts/Start-Demo.ps1 for live fridges.'
+    Write-Output 'Edge running: configuration http://127.0.0.1:5300, gateway -> Mosquitto :8883. Logs: logs/'
+    Write-Output 'Register devices with POST http://127.0.0.1:5300/devices (or the demo console), e.g. ModSim on port 502.'
     Write-Output 'The gateway runs below (no backend: an empty HostId, so it publishes without waiting for one). Press Ctrl+C to stop everything.'
     dotnet (Join-Path $workspace 'src/EdgeGateway/EdgeGateway.Gateway/bin/Debug/net8.0/EdgeGateway.Gateway.dll') '--Sparkplug:HostId=' |
         Tee-Object -FilePath (Join-Path $logDirectory 'EdgeGateway.Gateway.log')

@@ -1,9 +1,5 @@
 name: dotnet-mqtt-demo
 
-x-fridge: &fridge
-  build: ./simulators/modbus
-  restart: "no"
-
 services:
   mosquitto:
     image: eclipse-mosquitto:2.1.2-alpine
@@ -23,20 +19,6 @@ services:
         bind:
           create_host_path: false
       - mosquitto-data:/mosquitto/data
-
-  # Simulated field devices: plain Modbus TCP servers (pymodbus), one per fridge.
-  fridge-01:
-    <<: *fridge
-    environment: { DEVICE_NAME: fridge-01 }
-    ports: ["127.0.0.1:5021:502"]
-  fridge-02:
-    <<: *fridge
-    environment: { DEVICE_NAME: fridge-02 }
-    ports: ["127.0.0.1:5022:502"]
-  fridge-03:
-    <<: *fridge
-    environment: { DEVICE_NAME: fridge-03 }
-    ports: ["127.0.0.1:5023:502"]
 
 volumes:
   mosquitto-data:

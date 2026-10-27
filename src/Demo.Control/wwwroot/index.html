@@ -54,7 +54,7 @@
   .toast.show { opacity: 1; transform: none; }
   .toast.error { background: var(--bad); color: #fff; }
 
-  /* Pipeline: three fridges, each with its own link into the edge broker */
+  /* Pipeline: one box per registered device, each with its own Modbus link into the gateway */
   .pipeline { display: grid; align-items: center;
     grid-template-columns: minmax(0,1.5fr) minmax(0,1.2fr) auto minmax(0,1fr) auto minmax(0,1fr); }
   .fridges { display: grid; gap: 6px; }
@@ -96,6 +96,10 @@
   .big { font-size: 40px; font-weight: 750; line-height: 1; font-variant-numeric: tabular-nums; }
   .big.warn { color: var(--warn); } .big.ok { color: var(--ok); }
   .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .dline { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .dline .who { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  .dline .num { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .dline .derr { flex-basis: 100%; color: var(--bad); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ctable { display: grid; grid-template-columns: auto auto 1fr 1fr 1fr; gap: 8px 8px; align-items: center; font-size: 13px; }
   .ctable .h { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   .ctable .who { display: flex; align-items: center; gap: 6px; font-weight: 600; }
@@ -220,7 +224,7 @@
   </header>
 
   <section class="panel">
-    <h2>Data path <span class="note sub">Stop = clean shutdown · Crash = kill without warning · fridges are pymodbus simulators polled over Modbus TCP</span></h2>
+    <h2>Data path <span class="note sub">Stop = clean shutdown · Crash = kill without warning · devices are external Modbus TCP servers (ModSim, PLCs) registered in the Device registry</span></h2>
     <div class="pipeline" id="pipeline"></div>
   </section>
 
@@ -232,19 +236,19 @@
       <dl class="kv" style="margin-top:12px" id="g-kv"></dl>
     </div>
     <div class="panel">
-      <h2>Fridges (physical world, written into each simulator over Modbus)</h2>
-      <div class="ctable" id="controls"></div>
-      <div class="hint">Door: GPIO input, temperature rises while open · Fault: temperature climbs past the 8 °C alarm · Pause: register values freeze</div>
+      <h2>Devices being polled</h2>
+      <div id="controls"></div>
+      <div class="hint">Devices come from the Device registry tab: any Modbus TCP server, e.g. ModSim or a PLC. Values change on the device itself.</div>
     </div>
     <div class="panel">
       <h2>Resilience test <button class="btn sm primary" id="run-test" style="margin-left:auto">Run</button></h2>
-      <ul class="steps" id="steps"><li><span></span><span class="sub">Crashes and restarts each component in turn (about 2½ minutes), then checks every fridge's readings arrived exactly once.</span></li></ul>
+      <ul class="steps" id="steps"><li><span></span><span class="sub">Crashes and restarts each component in turn (about 2½ minutes), then checks every registered device's readings arrived exactly once.</span></li></ul>
       <div id="result"></div>
     </div>
   </section>
 
   <section class="stats" id="stats">
-    <div class="panel stat" id="s-readings"><div class="value">—</div><div class="label">Readings on Mosquitto (all fridges)</div></div>
+    <div class="panel stat" id="s-readings"><div class="value">—</div><div class="label">Readings on Mosquitto (all devices)</div></div>
     <div class="panel stat" id="s-missing"><div class="value">—</div><div class="label">Missing readings</div></div>
     <div class="panel stat" id="s-duplicates"><div class="value">—</div><div class="label">Duplicate readings</div></div>
     <div class="panel stat" id="s-historical"><div class="value">—</div><div class="label">Replayed as historical</div></div>
@@ -259,7 +263,7 @@
       </div>
       <div class="panel" id="chart-panel">
         <h2>Temperature by measurement time</h2>
-        <svg id="chart" viewBox="0 0 640 240" role="img" aria-label="Temperature readings per fridge"></svg>
+        <svg id="chart" viewBox="0 0 640 240" role="img" aria-label="Temperature readings per device"></svg>
         <div class="legend" id="legend"></div>
       </div>
       <div class="panel">
@@ -267,7 +271,7 @@
         <div class="flows">
           <div><b class="badge b-STATE">STATE</b><span>A Primary Host's online/offline. None in this flow, so the gateway does not wait for one.</span></div>
           <div><b class="badge b-NBIRTH">NBIRTH</b><span>Gateway session start: seq 0, bdSeq, Node Control/Rebirth.</span></div>
-          <div><b class="badge b-DBIRTH">DBIRTH</b><span>A device introduced with all its metrics; one per fridge.</span></div>
+          <div><b class="badge b-DBIRTH">DBIRTH</b><span>A device introduced with all its metrics; one per device.</span></div>
           <div><b class="badge b-DDATA">DDATA</b><span>A reading. seq 0–255 (shared across the gateway) detects gaps; DeviceSeq removes duplicates.</span></div>
           <div><b class="badge b-NDATA">NDATA</b><span>Gateway heartbeat (uptime).</span></div>
           <div><b class="badge b-DDEATH">DDEATH</b><span>One device lost: data acquisition failed to poll it 3 times in a row, or it was removed from the registry. The others are unaffected.</span></div>
@@ -307,9 +311,9 @@ const TAB_NOTES = {
   activity: "Everything that changed, newest first: registry edits, configuration loads, devices online, failing or offline, births and deaths, broker connection and replay, component actions and door/fault commands. Readings are on the wire tab.",
   logs: "Console output of the selected component."
 };
-let fridgeIds = [], tab = "upstream", logName = "gateway", state = null, view = null;
+let pathIds = [], tab = "upstream", logName = "gateway", state = null, view = null;
 let lastWireId = 0, lastHistorical = null, busy = false;
-// Simulated fridges first, then any other device the registry added, so colors stay stable.
+// Devices in the order the gateway reports them, then any extra the subscriber has seen, so colors stay stable.
 let deviceIds = [];
 const color = id => `var(--c${Math.max(0, deviceIds.indexOf(id)) % 3 + 1})`;
 
@@ -356,43 +360,41 @@ function buildPipeline() {
       <div class="detail" id="d-${name}">—</div>
       <div class="actions" id="a-${name}"></div>
     </div>`;
+  // Devices are external Modbus servers (ModSim, PLCs) registered in the configuration service; one box each.
   $("pipeline").innerHTML = `
-    <div class="fridges">${fridgeIds.map(id => `
+    <div class="fridges">${pathIds.length ? pathIds.map(id => `
       <div class="frow">
-        <div class="node mini idle" id="n-${id}">
-          <div class="head"><span class="name"><span class="dot"></span><span class="swatch" style="background:${color(id)}"></span>${id}</span>
-            <span class="actions" id="a-${id}"></span></div>
-          <div class="detail" id="d-${id}">—</div>
+        <div class="node mini idle" id="n-${esc(id)}">
+          <div class="head"><span class="name"><span class="dot"></span><span class="swatch" style="background:${color(id)}"></span>${esc(id)}</span></div>
+          <div class="detail" id="d-${esc(id)}">—</div>
         </div>
-        <div class="linkwrap"><small>Modbus</small><div class="link" id="l-${id}" style="--dotc:${color(id)}"></div></div>
-      </div>`).join("")}
+        <div class="linkwrap"><small>Modbus</small><div class="link" id="l-${esc(id)}" style="--dotc:${color(id)}"></div></div>
+      </div>`).join("") : `
+      <div class="frow"><div class="node mini idle"><div class="name"><span class="dot"></span>No devices</div>
+        <div class="detail">Add one in the Device registry tab (e.g. ModSim on port 502).</div></div>
+        <div class="linkwrap"><small>Modbus</small><div class="link cut"></div></div></div>`}
     </div>
     <div class="edge-col">${core("configuration")}<div class="vlink"><div class="bar" id="l-config"></div><small id="t-config">HTTP GET /config every 10 s · device list</small></div>${core("gateway")}</div>
     ${core("mosquitto", "Sparkplug B")}
     ${core("subscribers", "Sparkplug B")}`;
 }
 
-function fridgeView(id) { return state.fridges.find(f => f.id === id); }
 function up(name) { return state.components.find(c => c.name === name)?.running; }
+const DEVICE_TONE = { polling: "ok", failing: "bad", offline: "bad", connecting: "idle" };
 
 function nodeState(c, gw) {
   if (!c.running) return "bad";
   if (c.name === "gateway" && gw && (gw.upstream !== "Online" || !gw.hostOnline)) return "warn";
   if (c.name === "configuration" && !state.configurationReachable) return "warn";
-  if (fridgeIds.includes(c.name) && fridgeView(c.name)?.controls.paused) return "warn";
   return "ok";
 }
 
 function nodeDetail(c, gw) {
   if (!c.running) return c.kind === "container" ? `container ${c.status}` : "stopped";
-  if (fridgeIds.includes(c.name)) {
-    const f = fridgeView(c.name);
-    return `Modbus :${f.port} · polled #${f.lastPolled || "—"} · GPIO ${f.gpioPin}${f.controls.paused ? " · frozen" : ""}${f.controls.doorOpen ? " · door open" : ""}${f.controls.spike ? " · fault" : ""}`;
-  }
   switch (c.name) {
     case "gateway":
       if (!gw) return "starting…";
-      return `polling ${state.fridges.filter(f => f.lastPolled).length} device(s) · ${gw.upstream === "Online" ? "publishing" : "broker unreachable"} · ${gw.unsent} buffered`;
+      return `polling ${(gw.devices ?? []).filter(s => s.state === "polling").length}/${(gw.devices ?? []).length} device(s) · ${gw.upstream === "Online" ? "publishing" : "broker unreachable"} · ${gw.unsent} buffered`;
     case "configuration": return state.configurationReachable ? "serving the device list" : "starting…";
     default: return state.monitors.upstream ? "running · persistence on" : "running · connecting";
   }
@@ -404,7 +406,7 @@ function renderPipeline() {
   for (const c of state.components) {
     const node = $("n-" + c.name);
     if (!node) continue;
-    node.className = "node" + (fridgeIds.includes(c.name) ? " mini " : " ") + nodeState(c, gw);
+    node.className = "node " + nodeState(c, gw);
     $("d-" + c.name).textContent = nodeDetail(c, gw);
     const actions = $("a-" + c.name), key = c.actions.join(",");
     if (actions.dataset.key !== key) {
@@ -412,7 +414,16 @@ function renderPipeline() {
       actions.innerHTML = c.actions.map(a => `<button class="btn sm${a === "crash" ? " danger" : ""}" data-act="${c.name}/${a}">${a[0].toUpperCase() + a.slice(1)}</button>`).join("");
     }
   }
-  for (const id of fridgeIds) $("l-" + id).classList.toggle("cut", !(up[id] && up.gateway));
+  // Device boxes show what the gateway's poller reports for each registered device.
+  for (const id of pathIds) {
+    const s = gatewayDevice(id), node = $("n-" + id);
+    if (!node) continue;
+    node.className = "node mini " + (s ? DEVICE_TONE[s.state] ?? "idle" : "idle");
+    $("d-" + id).textContent = s
+      ? `${s.endpoint} · ${s.state}${s.lastSeq ? ` · #${s.lastSeq}` : ""}${s.lastError ? ` · ${s.lastError.split(":")[0]}` : ""}`
+      : "waiting for the gateway";
+    $("l-" + id).classList.toggle("cut", !(up.gateway && s?.state === "polling"));
+  }
   $("l-mosquitto").classList.toggle("cut", !(up.gateway && up.mosquitto));
   // The gateway asks the registry every 10 s; when the registry is down it keeps polling from its cached copy.
   const registryUp = up.configuration && state.configurationReachable;
@@ -433,7 +444,7 @@ function pulse(...ids) {
   }
 }
 
-// Gateway, fridges, scenario
+// Gateway, devices, scenario
 function renderGateway() {
   const gw = state.gateway;
   const big = $("g-unsent");
@@ -446,16 +457,19 @@ function renderGateway() {
     <dt>Last sent</dt><dd>${esc(gw.lastPublished ?? "—")}</dd>` : `<dt>Status</dt><dd>gateway not running</dd>`;
 }
 
-function renderControls() {
-  const cell = (f, on, cmdOn, cmdOff, textOn, textOff) =>
-    `<button class="btn sm${on ? " on" : ""}" data-cmd="${f.id}/${on ? cmdOff : cmdOn}"${f.running && !busy ? "" : " disabled"}>${on ? textOn : textOff}</button>`;
-  $("controls").innerHTML = `<span class="h">Fridge</span><span class="h">Polled</span><span class="h">Door</span><span class="h">Cooling</span><span class="h">Readings</span>` +
-    state.fridges.map(f => `
-      <span class="who"><span class="swatch" style="background:${color(f.id)}"></span>${esc(f.id)}</span>
-      <span class="num">#${f.lastPolled || "—"}</span>
-      ${cell(f, f.controls.doorOpen, "door-open", "door-close", "Close door", "Open door")}
-      ${cell(f, f.controls.spike, "spike-on", "spike-off", "Fix cooling", "Start fault")}
-      ${cell(f, f.controls.paused, "pause", "resume", "Resume", "Pause")}`).join("");
+// A compact status list of every device the gateway is polling.
+function renderDeviceList() {
+  const devices = state.gateway?.devices ?? [];
+  $("controls").innerHTML = !state.gateway
+    ? '<div class="empty">Gateway not running.</div>'
+    : devices.length
+      ? devices.map(s => `<div class="dline">
+          <span class="who"><span class="swatch" style="background:${color(s.deviceId)}"></span>${esc(s.deviceId)}</span>
+          <span class="tag ${DEVICE_TONE[s.state] ?? ""}">${esc(s.state)}</span>
+          <span class="num">${esc(s.endpoint)} · #${esc(s.lastSeq || "—")}</span>
+          ${s.lastError ? `<span class="derr" title="${esc(s.lastError)}">${esc(s.lastError)}</span>` : ""}
+        </div>`).join("")
+      : '<div class="empty">No devices registered. Add one in the Device registry tab.</div>';
 }
 
 function renderScenario() {
@@ -598,7 +612,7 @@ async function renderFeed() {
     const previous = lastWireId;
     lastWireId = Math.max(lastWireId, messages[0]?.id ?? 0);
     feed.innerHTML = messages.length ? messages.map(m => {
-      const device = fridgeIds.find(id => m.topic.includes("/" + id));
+      const device = pathIds.find(id => m.topic.endsWith("/" + id));
       return `<div class="row${previous && m.id > previous ? " new" : ""}">
         <time>${esc(time(m.at))}</time>
         <span class="badge b-${esc(m.type)}">${esc(m.type)}</span>
@@ -674,13 +688,13 @@ function metricRow(m = {}) {
 function openDeviceForm(device) {
   formOpen = true;
   formEditing = device?.id ?? null;
-  const d = device ?? { id: "", enabled: true, host: "127.0.0.1", port: 5021, unitId: 1, pollIntervalSeconds: 3, gpioPin: null,
+  const d = device ?? { id: "", enabled: true, host: "127.0.0.1", port: 502, unitId: 1, pollIntervalSeconds: 3, gpioPin: null,
     description: "", metrics: [{ name: "Temperature", register: "holding", address: 0, dataType: "int16", scale: 0.1, unit: "°C" }] };
   const field = (key, label, input) => `<label><span>${label}</span>${input}</label>`;
   $("feed").innerHTML = `<form class="dform" id="device-form" autocomplete="off" novalidate>
     <h3>${device ? `Edit ${esc(device.id)}` : "Add device"}</h3>
     <div class="fgrid">
-      ${field("id", "Device ID", `<input name="id" value="${esc(d.id)}" ${device ? "readonly" : ""} required placeholder="fridge-04">`)}
+      ${field("id", "Device ID", `<input name="id" value="${esc(d.id)}" ${device ? "readonly" : ""} required placeholder="modsim-02">`)}
       ${field("host", "Host", `<input name="host" value="${esc(d.host)}" required>`)}
       ${field("port", "Modbus TCP port", `<input name="port" type="number" min="1" max="65535" value="${esc(d.port)}" required>`)}
       ${field("unitId", "Unit ID", `<input name="unitId" type="number" min="0" max="255" value="${esc(d.unitId)}" required>`)}
@@ -693,7 +707,7 @@ function openDeviceForm(device) {
     <div id="metric-rows">${d.metrics.map(metricRow).join("")}</div>
     <div class="factions">
       <button class="btn sm" data-form="add-metric">Add metric</button>
-      <span class="hint">Simulator registers: holding 0 temperature ×10 · 1 humidity ×10 · 10–11 power float32 · 12–13 door count uint32 · coil 0 door</span>
+      <span class="hint">Addresses are 0-based: ModSim register 40001 is holding address 0. 32-bit types use two registers.</span>
     </div>
     <div class="ferror" id="form-error" role="alert"></div>
     <div class="factions"><button class="btn primary" data-form="save">${device ? "Save changes" : "Add device"}</button>
@@ -730,13 +744,6 @@ function readDeviceForm() {
 async function saveDeviceForm() {
   const device = readDeviceForm();
   const editing = formEditing;
-  // The demo simulators only have addresses 0–99; anything beyond is answered with "illegal data address".
-  const simulator = ["127.0.0.1", "localhost"].includes(device.host) && device.port >= 5021 && device.port <= 5023;
-  const width = m => ["int32", "uint32", "float32"].includes(m.dataType) ? 2 : 1;
-  const outside = device.metrics.filter(m => m.address + width(m) - 1 > 99).map(m => `${m.name} (${m.address})`);
-  if (simulator && outside.length &&
-      !confirm(`The demo simulators only have addresses 0–99, so these metrics will fail every poll: ${outside.join(", ")}.\n\nSave anyway?`))
-    return;
   const response = await fetch(editing ? `/api/config/devices/${encodeURIComponent(editing)}` : "/api/config/devices", {
     method: editing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(device)
   });
@@ -784,9 +791,9 @@ async function refresh() {
     $("monitor-pill").lastElementChild.textContent = "Demo console not reachable";
     return;
   }
-  const ids = state.fridges.map(f => f.id);
-  if (ids.join() !== fridgeIds.join()) { fridgeIds = ids; buildPipeline(); }
-  deviceIds = [...new Set([...fridgeIds, ...(view?.devices ?? []).map(d => d.deviceId), ...(state.gateway?.devices ?? []).map(s => s.deviceId)])];
+  const ids = (state.gateway?.devices ?? []).map(s => s.deviceId);
+  if (ids.join() !== pathIds.join() || !$("pipeline").children.length) { pathIds = ids; buildPipeline(); }
+  deviceIds = [...new Set([...pathIds, ...(view?.devices ?? []).map(d => d.deviceId), ...(state.gateway?.devices ?? []).map(s => s.deviceId)])];
   const previousCounts = Object.fromEntries((view?.summaries ?? []).map(s => [s.deviceId, s.readings]));
   try {
     const [gateways, devices, summaries, ...histories] = await Promise.all([
@@ -796,22 +803,20 @@ async function refresh() {
   } catch { /* keep the last known data */ }
   renderPipeline();
   renderGateway();
-  renderControls();
+  renderDeviceList();
   renderScenario();
   renderView();
   // Animate the path for each device whose reading count went up since the last refresh.
   const arrived = (view?.summaries ?? []).filter(s => previousCounts[s.deviceId] !== undefined && s.readings > previousCounts[s.deviceId]).map(s => s.deviceId);
   if (arrived.length) pulse(...arrived, "mosquitto", "subscribers");
   else if (state.gateway?.unsent > 0)
-    pulse(...state.fridges.filter(f => f.running && !f.controls.paused).map(f => f.id));
+    pulse(...(state.gateway?.devices ?? []).filter(s => s.state === "polling").map(s => s.deviceId));
   await renderFeed();
 }
 
 document.addEventListener("click", e => {
   const act = e.target.closest("[data-act]");
   if (act) { const [name, action] = act.dataset.act.split("/"); post(`/api/components/${name}/${action}`, `${CORE[name]?.label ?? name}: ${action}`); return; }
-  const cmd = e.target.closest("[data-cmd]");
-  if (cmd) { const [id, command] = cmd.dataset.cmd.split("/"); post(`/api/fridges/${id}/${command}`, `${id}: ${cmd.textContent.toLowerCase()}`); return; }
   const registry = e.target.closest("[data-registry]");
   if (registry) { registryAction(registry.dataset.registry); return; }
   const demo = e.target.closest("[data-demo]");

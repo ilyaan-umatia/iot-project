@@ -41,7 +41,6 @@ app.MapGet("/api/state", async (ResilienceScenario scenario, WireMonitor monitor
     gateway = components.ReadGatewayStatus(),
     monitorConnected = monitor.Connected("upstream"),
     configurationReachable = await components.ConfigurationReachableAsync(),
-    fridges = components.DescribeFridges(),
     monitors = new { upstream = monitor.Connected("upstream") },
     scenario = scenario.Snapshot()
 });
@@ -109,8 +108,6 @@ app.MapGet("/api/view/history/{id}", (string id, SparkplugView view) => view.His
 
 app.MapPost("/api/components/{name}/{action}", (string name, string action) =>
     Run(() => components.ActAsync(name, action)));
-app.MapPost("/api/fridges/{id}/{command}", (string id, string command) =>
-    Run(() => Task.FromResult(components.SendFridgeCommand(id, command))));
 app.MapPost("/api/demo/start-all", () => Run(async () => { await components.StartAllAsync(); return "Everything started."; }));
 app.MapPost("/api/demo/stop-all", () => Run(async () => { await components.StopAllAsync(); return "Everything stopped."; }));
 app.MapPost("/api/demo/reset", (SparkplugView view) => Run(async () =>

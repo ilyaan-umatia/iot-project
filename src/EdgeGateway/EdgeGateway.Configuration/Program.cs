@@ -18,8 +18,6 @@ builder.Services.AddSingleton(_ => new DeviceStore(databasePath));
 
 var app = builder.Build();
 var store = app.Services.GetRequiredService<DeviceStore>();
-if (store.IsEmpty)
-    foreach (var device in SeedDevices()) store.Save(device, create: true);
 
 app.MapGet("/", () => "Edge gateway configuration service.");
 app.MapGet("/health", () => "ok");
@@ -43,17 +41,3 @@ static IResult Write(Func<IResult> action)
     catch (ArgumentException error) { return Results.BadRequest(new { message = error.Message }); }
 }
 
-// Three demo fridges on the pymodbus simulators. Registers: holding 0 = temperature x10 (int16),
-// holding 1 = humidity x10 (uint16), holding 10-11 = compressor power in W (float32),
-// holding 12-13 = door openings (uint32 counter), coil 0 = door switch (GPIO input).
-static IEnumerable<DeviceDefinition> SeedDevices() =>
-    new (string Id, int Port, int Pin)[] { ("fridge-01", 5021, 17), ("fridge-02", 5022, 18), ("fridge-03", 5023, 27) }
-        .Select(fridge => new DeviceDefinition(fridge.Id, true, DeviceDefinition.ModbusTcp, "127.0.0.1", fridge.Port, 1,
-            3, fridge.Pin, $"Demo fridge on Modbus TCP port {fridge.Port}",
-            [
-                new("Temperature", "holding", 0, 0.1, "°C", "int16"),
-                new("Humidity", "holding", 1, 0.1, "%", "uint16"),
-                new("CompressorPower", "holding", 10, 1, "W", "float32", "big"),
-                new("DoorOpenings", "holding", 12, 1, "count", "uint32", "big"),
-                new("GpioValue", "coil", 0, 1, "door", "bool")
-            ]));
