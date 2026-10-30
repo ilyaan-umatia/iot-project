@@ -58,6 +58,8 @@ The backend (`Application.Api`) is not part of this flow; MQTTX and the demo con
 
 Multiple devices can reference the same interface with their own Unit IDs and metric maps. Updating an interface bumps the configuration version and reloads affected pollers. A referenced interface cannot be deleted; reassign or remove its devices first. Removing a device keeps its interface available for reuse. TCP connection/read/write timeouts remain fixed at 2000 ms.
 
+Configuration schema is managed by its own EF Core migrations, applied at service startup. The baseline creates fresh DBs and adopts the current shared-interface schema while preserving records and configuration version. Its context, migration history and DB remain separate from Gateway. See [Configuration migrations](docs/configuration-migrations.md) for commands and details.
+
 `ModbusRtu` interfaces accept JSON settings such as `{"portName":"COM3","baudRate":19200,"dataBits":8,"parity":"Even","stopBits":1}`. This is **configuration-only**: serial devices must have `enabled:false`; no serial port is opened and no RTU polling runs.
 
 This schema starts with a fresh Configuration DB; old device-registration bodies are not supported. On the initial switch, stop the applications and remove only the old Configuration DB and gateway `config-cache.json`. For the demo these are `logs/demo/state/configuration.db` (including any `-wal`/`-shm` sidecars after stopping) and `logs/demo/state/daq/config-cache.json`. Keep `outbox.db`, sequence files and node state. The configuration service reports an explicit error if pointed at the old schema. Do not use **Reset demo** for this transition: it also removes the outbox and broker state.
@@ -94,6 +96,8 @@ In MQTTX, connect to `127.0.0.1:8883` with TLS, trust `broker/certs/broker.crt`,
 
 ## Reliability behaviour
 
+- **Broker connection history:** the Gateway records observed outages, reconnect times, downtime and buffered/acknowledged message counts in `BrokerHistory` inside its runtime DB. Gateway schema is managed by EF Core migrations, applied at startup. The initial switch from pre-EF storage requires a fresh Gateway DB; Configuration DB is kept. See [broker-history.md](docs/broker-history.md) for migrations, schema, NULL meaning, limits and manual demo steps.
+
 - **Automatic reconnect:** the gateway retries Mosquitto with backoff (2 s doubling to 30 s), then sends a new NBIRTH and a DBIRTH per online device.
 - **Data restored after disconnects:** every polled reading is committed to the SQLite outbox first; after a reconnect the backlog is replayed in order, marked `is_historical`, and each row is marked sent only after the broker's acknowledgement.
 - **Source timestamps:** a reading carries the time the poll request was sent, and keeps it through buffering and replay.
@@ -104,8 +108,11 @@ In MQTTX, connect to `127.0.0.1:8883` with TLS, trust `broker/certs/broker.crt`,
 
 ## Checks and limits
 
+Demo diagnostics are written to `status.json` once per second. Temporary Windows file-sharing errors are retried on the next update. The console distinguishes a stopped Gateway from a running Gateway whose live status is unavailable, and keeps enabled registry devices visible in the Data Path while waiting for polling status. This diagnostic file does not carry or buffer readings.
+
 ```powershell
 dotnet run --project tests/IoT.Checks
+node tests/IoT.Checks/demo-status-ui.cjs
 ```
 
 - **Polling gaps:** while the gateway is down, nothing is read. A poller also pauses while its pending sample cannot be saved; readings are durable only after the SQLite commit.

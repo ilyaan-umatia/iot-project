@@ -92,10 +92,9 @@ try
                     config = new { version = acquisition.ConfigState.Version, reachable = acquisition.ConfigState.Reachable },
                     devices = acquisition.Statuses()
                 }, IoT.Contracts.EdgeTopics.Json);
-                File.WriteAllText(path + ".tmp", json);
-                File.Move(path + ".tmp", path, overwrite: true);
+                GatewayStatusFile.TryWrite(path, json);
             }
-            catch (IOException) { }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
             try { await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken); }
             catch (OperationCanceledException) { }
         }

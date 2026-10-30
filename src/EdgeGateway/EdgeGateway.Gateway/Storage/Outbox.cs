@@ -1,13 +1,14 @@
 using System.Text.Json;
 using IoT.Contracts;
 using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 
 namespace EdgeGateway.Gateway.Storage;
 
 public sealed record OutboxRow(long Id, string Kind, string DeviceId, DeviceReading? Reading, DateTimeOffset CreatedAt);
 
 // Polled readings are committed before publishing and marked sent only after the broker's PUBACK.
-public sealed class Outbox : IDisposable
+public sealed partial class Outbox : IDisposable
 {
     private readonly SqliteConnection _connection;
     private readonly object _gate = new();
@@ -20,31 +21,24 @@ public sealed class Outbox : IDisposable
             databasePath = Path.GetFullPath(databasePath);
             Directory.CreateDirectory(Path.GetDirectoryName(databasePath)!);
         }
-        _connection = new(new SqliteConnectionStringBuilder { DataSource = databasePath, Pooling = false }.ToString());
+        _connection = new(new SqliteConnectionStringBuilder { DataSource = databasePath, Pooling = false, ForeignKeys = true }.ToString());
         _connection.Open();
-        Execute("""
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
-            CREATE TABLE IF NOT EXISTS Outbox (
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Kind TEXT NOT NULL,
-                DeviceId TEXT NOT NULL,
-                DeviceSeq INTEGER,
-                Reading TEXT,
-                CreatedAt INTEGER NOT NULL,
-                SentAt INTEGER,
-                UNIQUE (DeviceId, DeviceSeq)
-            );
-            CREATE INDEX IF NOT EXISTS IX_Outbox_Unsent ON Outbox (Id) WHERE SentAt IS NULL;
-            CREATE TABLE IF NOT EXISTS Devices (
-                DeviceId TEXT PRIMARY KEY,
-                IntakeOnline INTEGER NOT NULL DEFAULT 0,
-                PublishedOnline INTEGER NOT NULL DEFAULT 0,
-                PublishedReading TEXT
-            );
-            """);
-        if (Scalar("SELECT 1 FROM pragma_table_info('Devices') WHERE name = 'MetricSignature'") is null)
-            Execute("ALTER TABLE Devices ADD COLUMN MetricSignature TEXT");
+        try
+        {
+            if (Scalar("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'") is null
+                && Scalar("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('Outbox', 'Devices', 'BrokerHistory')") is not null)
+                throw new InvalidOperationException($"Gateway DB uses the pre-EF schema: {databasePath}. Stop the Gateway and use a fresh Gateway DB. Configuration DB is separate and must be kept.");
+            using var database = new GatewayDbContext(new DbContextOptionsBuilder<GatewayDbContext>()
+                .UseSqlite(_connection).Options);
+            database.Database.Migrate();
+            Execute("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
+        }
+        catch
+        {
+            _connection.Dispose();
+            _added.Dispose();
+            throw;
+        }
     }
 
     // Returns false if this device's reading number is already stored.
@@ -127,8 +121,14 @@ public sealed class Outbox : IDisposable
         lock (_gate)
         {
             using var transaction = _connection.BeginTransaction();
-            Execute("UPDATE Outbox SET SentAt = $now WHERE Id = $id", transaction,
-                ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", row.Id));
+            // The conditional transition makes repeated ACK handling a no-op, including its history count.
+            if (Execute("UPDATE Outbox SET SentAt = $now WHERE Id = $id AND SentAt IS NULL", transaction,
+                    ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", row.Id)) == 0)
+                return;
+            Execute("""
+                UPDATE BrokerHistory SET BufferedMessagesSent = BufferedMessagesSent + 1
+                WHERE Id = (SELECT BrokerHistoryId FROM Outbox WHERE Id = $id)
+                """, transaction, ("$id", row.Id));
             if (row.Kind == "DDEATH")
                 Execute("UPDATE Devices SET PublishedOnline = 0 WHERE DeviceId = $device", transaction, ("$device", row.DeviceId));
             else
@@ -175,17 +175,17 @@ public sealed class Outbox : IDisposable
 
     private void Insert(string kind, string deviceId, DeviceReading? reading, SqliteTransaction transaction) =>
         Execute("""
-            INSERT INTO Outbox (Kind, DeviceId, DeviceSeq, Reading, CreatedAt)
-            VALUES ($kind, $device, $seq, $reading, $now)
+            INSERT INTO Outbox (Kind, DeviceId, DeviceSeq, Reading, CreatedAt, BrokerHistoryId)
+            VALUES ($kind, $device, $seq, $reading, $now, $history)
             """, transaction, ("$kind", kind), ("$device", deviceId),
             ("$seq", reading is null ? null : (long)reading.DeviceSeq),
             ("$reading", reading is null ? null : JsonSerializer.Serialize(reading, EdgeTopics.Json)),
-            ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+            ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$history", _activeBrokerHistoryId));
 
-    private void Execute(string sql, SqliteTransaction? transaction = null, params (string Name, object? Value)[] values)
+    private int Execute(string sql, SqliteTransaction? transaction = null, params (string Name, object? Value)[] values)
     {
         using var command = Command(sql, transaction, values);
-        command.ExecuteNonQuery();
+        return command.ExecuteNonQuery();
     }
 
     private object? Scalar(string sql, SqliteTransaction? transaction = null, params (string Name, object? Value)[] values)

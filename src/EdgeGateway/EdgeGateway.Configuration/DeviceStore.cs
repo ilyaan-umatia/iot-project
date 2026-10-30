@@ -1,6 +1,8 @@
 using System.Text.Json;
 using IoT.Contracts;
 using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using EdgeGateway.Configuration.Storage;
 
 namespace EdgeGateway.Configuration;
 
@@ -29,18 +31,10 @@ public sealed class DeviceStore : IDisposable
                 if (columns.Count > 0 && !columns.Contains("InterfaceId"))
                     throw new InvalidOperationException("Old Configuration DB schema. Stop the configuration service and remove only its configuration.db (and old gateway config-cache.json), then restart. Do not remove the gateway outbox or node state.");
             }
-            Execute("""
-                PRAGMA journal_mode = WAL;
-                CREATE TABLE IF NOT EXISTS Interfaces (
-                    Id TEXT NOT NULL PRIMARY KEY, Type TEXT NOT NULL, Settings TEXT NOT NULL CHECK(json_valid(Settings)));
-                CREATE TABLE IF NOT EXISTS Devices (
-                    Id TEXT NOT NULL PRIMARY KEY,
-                    InterfaceId TEXT NOT NULL REFERENCES Interfaces(Id) ON DELETE RESTRICT,
-                    Data TEXT NOT NULL CHECK(json_valid(Data)));
-                CREATE INDEX IF NOT EXISTS IX_Devices_InterfaceId ON Devices(InterfaceId);
-                CREATE TABLE IF NOT EXISTS Meta (Key TEXT PRIMARY KEY, Value INTEGER NOT NULL);
-                INSERT OR IGNORE INTO Meta (Key, Value) VALUES ('Version', 0);
-                """);
+            using var database = new ConfigurationDbContext(new DbContextOptionsBuilder<ConfigurationDbContext>()
+                .UseSqlite(_connection).Options);
+            database.Database.Migrate();
+            Execute("PRAGMA journal_mode = WAL;");
         }
         catch { _connection.Dispose(); throw; }
     }

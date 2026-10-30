@@ -22,6 +22,8 @@ public sealed class MqttConnection : IDisposable
     public bool IsConnected => _client.IsConnected;
     public ConnectionState State => _state.Current;
     public event Func<string, byte[], Task>? MessageReceived;
+    public event Action<bool, DateTimeOffset>? ConnectivityChanged;
+    private volatile bool _intentionalDisconnect;
     private readonly X509Certificate2? _trustedCertificate;
 
     public MqttConnection(MqttSettings settings, SparkplugSettings sparkplug)
@@ -49,8 +51,15 @@ public sealed class MqttConnection : IDisposable
         _optionsBuilder = builder;
         _sequenceStore = new BirthDeathSequenceStore(settings.ClientId, settings.StateDirectory);
         _deathTopic = SparkplugTopics.NodeDeath(sparkplug);
-        _client.DisconnectedAsync += _ =>
+        _client.ConnectedAsync += _ =>
         {
+            ConnectivityChanged?.Invoke(true, DateTimeOffset.UtcNow);
+            return Task.CompletedTask;
+        };
+        _client.DisconnectedAsync += args =>
+        {
+            if (args.ClientWasConnected && !_intentionalDisconnect)
+                ConnectivityChanged?.Invoke(false, DateTimeOffset.UtcNow);
             if (_state.TryMoveTo(ConnectionState.Disconnected))
             {
                 Console.WriteLine("Broker disconnected.");
@@ -70,6 +79,7 @@ public sealed class MqttConnection : IDisposable
 
         try
         {
+            _intentionalDisconnect = false;
             _disconnected = NewDisconnectSignal();
             BirthDeathSequence = _sequenceStore.ReserveNext();
             var options = _optionsBuilder
@@ -78,7 +88,16 @@ public sealed class MqttConnection : IDisposable
                 .WithWillQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                 .WithWillRetain(false)
                 .Build();
-            await _client.ConnectAsync(options, cancellationToken);
+            try
+            {
+                await _client.ConnectAsync(options, cancellationToken);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Includes first-start connection failures; local bdSeq/storage errors are outside this catch.
+                ConnectivityChanged?.Invoke(false, DateTimeOffset.UtcNow);
+                throw;
+            }
             Console.WriteLine($"Session bdSeq: {BirthDeathSequence}");
             if (!_state.TryMoveTo(ConnectionState.PublishingBirth))
                 throw new InvalidOperationException("Connection closed before the birth announcement.");
@@ -137,6 +156,7 @@ public sealed class MqttConnection : IDisposable
     }
     private async Task PublishDeathAndDisconnectAsync(CancellationToken cancellationToken)
     {
+        _intentionalDisconnect = true;
         await PublishAsync(_deathTopic, SparkplugPayloads.NodeDeath(BirthDeathSequence).ToByteArray(),
             cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
         Console.WriteLine($"Published NDEATH: {_deathTopic} (bdSeq {BirthDeathSequence})");

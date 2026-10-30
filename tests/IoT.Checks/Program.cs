@@ -6,6 +6,30 @@ using Org.Eclipse.Tahu.Protobuf;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 
+if (args is ["--configuration-migrations-only"])
+{
+    ConfigurationMigrationChecks.Run();
+    return;
+}
+
+if (args is ["--broker-history-only"])
+{
+    BrokerHistoryChecks.Run();
+    return;
+}
+
+if (args is ["--demo-status-only"])
+{
+    DemoStatusChecks.Run();
+    return;
+}
+
+if (args is ["--broker-history-live", var mosquitto])
+{
+    await BrokerHistoryChecks.RunLiveAsync(mosquitto);
+    return;
+}
+
 var decoder = new SparkplugDecoder();
 using var memoryStore = new TelemetryStore(":memory:");
 var state = new GpioMessageService(memoryStore);
@@ -338,3 +362,6 @@ finally
 }
 
 await ModbusChecks.RunAsync();
+BrokerHistoryChecks.Run();
+DemoStatusChecks.Run();
+ConfigurationMigrationChecks.Run();

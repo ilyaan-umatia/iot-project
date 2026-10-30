@@ -380,10 +380,12 @@ function buildPipeline() {
 }
 
 const DEVICE_TONE = { polling: "ok", failing: "bad", offline: "bad", connecting: "idle" };
+const gatewayRunning = () => state?.components.some(c => c.name === "gateway" && c.running) ?? false;
+const gatewayUnavailable = () => gatewayRunning() ? "Gateway running · live status temporarily unavailable" : "Gateway not running";
 
 function nodeState(c, gw) {
   if (!c.running) return "bad";
-  if (c.name === "gateway" && gw && (gw.upstream !== "Online" || !gw.hostOnline)) return "warn";
+  if (c.name === "gateway" && (!gw || gw.upstream !== "Online" || !gw.hostOnline)) return "warn";
   if (c.name === "configuration" && !state.configurationReachable) return "warn";
   return "ok";
 }
@@ -392,7 +394,7 @@ function nodeDetail(c, gw) {
   if (!c.running) return c.kind === "container" ? `container ${c.status}` : "stopped";
   switch (c.name) {
     case "gateway":
-      if (!gw) return "starting…";
+      if (!gw) return "running · waiting for live status";
       return `polling ${(gw.devices ?? []).filter(s => s.state === "polling").length}/${(gw.devices ?? []).length} device(s) · ${gw.upstream === "Online" ? "publishing" : "broker unreachable"} · ${gw.unsent} buffered`;
     case "configuration": return state.configurationReachable ? "serving the device list" : "starting…";
     default: return state.monitors.upstream ? "running · persistence on" : "running · connecting";
@@ -420,7 +422,7 @@ function renderPipeline() {
     node.className = "node mini " + (s ? DEVICE_TONE[s.state] ?? "idle" : "idle");
     $("d-" + id).textContent = s
       ? `${s.endpoint} · ${s.state}${s.lastSeq ? ` · #${s.lastSeq}` : ""}${s.lastError ? ` · ${s.lastError.split(":")[0]}` : ""}`
-      : "waiting for the gateway";
+      : gatewayRunning() ? "enabled in registry · waiting for live polling status" : "gateway stopped";
     $("l-" + id).classList.toggle("cut", !(up.gateway && s?.state === "polling"));
   }
   $("l-mosquitto").classList.toggle("cut", !(up.gateway && up.mosquitto));
@@ -453,14 +455,14 @@ function renderGateway() {
     <dt>Upstream</dt><dd>${esc(gw.upstream)}</dd>
     <dt>Host STATE</dt><dd>${gw.hostOnline ? "online" : "offline: buffering"}</dd>
     <dt>Session</dt><dd>bdSeq ${esc(gw.bdSeq)}</dd>
-    <dt>Last sent</dt><dd>${esc(gw.lastPublished ?? "—")}</dd>` : `<dt>Status</dt><dd>gateway not running</dd>`;
+    <dt>Last sent</dt><dd>${esc(gw.lastPublished ?? "—")}</dd>` : `<dt>Status</dt><dd>${esc(gatewayUnavailable())}</dd>`;
 }
 
 // A compact status list of every device the gateway is polling.
 function renderDeviceList() {
   const devices = state.gateway?.devices ?? [];
   $("controls").innerHTML = !state.gateway
-    ? '<div class="empty">Gateway not running.</div>'
+    ? `<div class="empty">${esc(gatewayUnavailable())}.</div>`
     : devices.length
       ? devices.map(s => `<div class="dline">
           <span class="who"><span class="swatch" style="background:${color(s.deviceId)}"></span>${esc(s.deviceId)}</span>
@@ -600,7 +602,7 @@ async function renderFeed() {
       registryInterfaces = interfaces;
       const cfg = state.gateway?.config;
       feed.innerHTML = `<div style="margin-bottom:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn sm primary" data-registry="add">Add device</button>
-          <span class="sub" style="font-size:12px">${state.gateway ? `Gateway has configuration v${esc(cfg?.version ?? "—")}${cfg && !cfg.reachable ? " · registry unreachable, using cached copy" : ""}` : "Gateway not running: no live status"}</span></div>` +
+          <span class="sub" style="font-size:12px">${state.gateway ? `Gateway has configuration v${esc(cfg?.version ?? "—")}${cfg && !cfg.reachable ? " · registry unreachable, using cached copy" : ""}` : gatewayUnavailable()}</span></div>` +
         (devices.length ? devices.map(d => `
         <div class="row" style="grid-template-columns: minmax(0,1fr) auto">
           <span class="text wrap"><b>${esc(d.id)}</b> · ${esc(d.interfaceId)} · ${esc(interfaceEndpoint(registryInterfaces.find(i => i.id === d.interfaceId)))} unit ${esc(d.unitId)} · every ${esc(d.pollIntervalSeconds)}s${d.gpioPin != null ? ` · GPIO ${esc(d.gpioPin)}` : ""}
@@ -675,7 +677,7 @@ function gatewayDevice(id) { return state?.gateway?.devices?.find(s => s.deviceI
 function pollStatus(device) {
   const s = gatewayDevice(device.id);
   if (!device.enabled) return '<div class="pstat"><span class="tag">not polled (disabled)</span></div>';
-  if (!state.gateway) return '<div class="pstat"><span class="tag">gateway not running</span></div>';
+  if (!state.gateway) return `<div class="pstat"><span class="tag">${esc(gatewayUnavailable())}</span></div>`;
   if (!s) return '<div class="pstat"><span class="tag">waiting for the gateway to load this device (up to 10 s)</span></div>';
   const tone = { polling: "ok", failing: "bad", offline: "warn" }[s.state] ?? "";
   const ago = iso => iso ? `${Math.max(0, Math.round((Date.now() - new Date(iso)) / 1000))} s ago` : "never";
@@ -923,7 +925,10 @@ async function refresh() {
     $("monitor-pill").lastElementChild.textContent = "Demo console not reachable";
     return;
   }
-  const ids = (state.gateway?.devices ?? []).map(s => s.deviceId);
+  // Registry membership is available even when diagnostics are temporarily missing or MQTT is down.
+  try { registryDevices = await getJson("/api/config/devices"); } catch { /* keep the last registry list */ }
+  const ids = [...new Set([...(state.gateway?.devices ?? []).map(s => s.deviceId),
+    ...registryDevices.filter(d => d.enabled).map(d => d.id)])];
   if (ids.join() !== pathIds.join() || !$("pipeline").children.length) { pathIds = ids; buildPipeline(); }
   deviceIds = [...new Set([...pathIds, ...(view?.devices ?? []).map(d => d.deviceId), ...(state.gateway?.devices ?? []).map(s => s.deviceId)])];
   const previousCounts = Object.fromEntries((view?.summaries ?? []).map(s => [s.deviceId, s.readings]));

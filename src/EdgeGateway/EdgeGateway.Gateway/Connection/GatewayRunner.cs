@@ -19,6 +19,31 @@ public sealed class GatewayRunner(MqttConnection connection, Outbox outbox, Gate
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        void RecordConnectivity(bool connected, DateTimeOffset observedAt)
+        {
+            if (cancellationToken.IsCancellationRequested) return;
+            try
+            {
+                if (connected) outbox.RecordBrokerConnected(observedAt);
+                else outbox.RecordBrokerDisconnected(observedAt);
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException error)
+            {
+                // A diagnostics write must not turn a successful MQTT connection into a failed one.
+                Console.Error.WriteLine($"Broker history could not be recorded: {error.Message}");
+            }
+        }
+        connection.ConnectivityChanged += RecordConnectivity;
+        try { await RunConnectionLoopAsync(cancellationToken); }
+        finally
+        {
+            connection.ConnectivityChanged -= RecordConnectivity;
+            outbox.EndBrokerObservation();
+        }
+    }
+
+    private async Task RunConnectionLoopAsync(CancellationToken cancellationToken)
+    {
         var mqtt = settings.Mqtt;
         if (mqtt.RetryDelaySeconds <= 0 || mqtt.MaxRetryDelaySeconds < mqtt.RetryDelaySeconds)
             throw new ArgumentException("Retry delays must be positive and the maximum must be at least the initial delay.");

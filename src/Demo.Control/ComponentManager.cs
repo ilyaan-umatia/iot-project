@@ -82,18 +82,22 @@ public sealed partial class ComponentManager : IDisposable
         lock (_containerStatus) return _containerStatus.GetValueOrDefault(name) == "running";
     }
 
-    // The gateway writes this snapshot every second; an old file means it is not running.
+    // Missing/old diagnostics do not mean the managed process stopped.
     public JsonElement? ReadGatewayStatus()
+        => ReadGatewaySnapshot(Path.Combine(_state, "status.json"), _processes[Gateway].Running);
+
+    public static JsonElement? ReadGatewaySnapshot(string path, bool running)
     {
-        var path = Path.Combine(_state, "status.json");
         try
         {
-            if (!_processes[Gateway].Running || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromSeconds(4))
+            if (!running || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromSeconds(4))
                 return null;
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var document = JsonDocument.Parse(stream);
             return document.RootElement.Clone();
         }
-        catch (Exception error) when (error is IOException or JsonException) { return null; }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException) { return null; }
     }
 
     public Task<bool> ConfigurationReachableAsync() => ReachableAsync(ConfigurationUrl + "/health");
