@@ -19,6 +19,7 @@ internal static class ModbusChecks
     public static async Task RunAsync()
     {
         CheckRegistry();
+        await InterfaceChecks.RunAsync();
         CheckMetricChangeRebirth();
         CheckFrames();
         CheckQuality();
@@ -32,15 +33,20 @@ internal static class ModbusChecks
 
     private static DeviceDefinition Fridge(string id, int port, bool enabled = true) => new(id, enabled,
         DeviceDefinition.ModbusTcp, "127.0.0.1", port, 1, 1, 17, "check",
-        [new("Temperature", "holding", 0, 0.1, "Â°C"), new("Humidity", "holding", 1, 0.1, "%"), new("GpioValue", "coil", 0, 1, "door")]);
+        [new("Temperature", "holding", 0, 0.1, "Â°C"), new("Humidity", "holding", 1, 0.1, "%"), new("GpioValue", "coil", 0, 1, "door")], $"tcp-{port}");
+
+    private static DeviceRegistration Registration(DeviceDefinition device) => new(device.Id, device.InterfaceId,
+        device.Enabled, device.UnitId, device.PollIntervalSeconds, device.GpioPin, device.Description, device.Metrics);
 
     private static void CheckRegistry()
     {
         using var store = new DeviceStore(":memory:");
-        Check(store.Save(Fridge("fridge-a", 5021), create: true), "Create failed.");
-        Check(!store.Save(Fridge("fridge-a", 5021), create: true), "Duplicate device was created.");
+        store.SaveInterface(new("tcp-5021", ModbusInterface.Tcp,
+            System.Text.Json.JsonSerializer.SerializeToElement(new TcpInterfaceSettings("127.0.0.1", 5021), EdgeTopics.Json)), create: true);
+        Check(store.Save(Registration(Fridge("fridge-a", 5021)), create: true), "Create failed.");
+        Check(!store.Save(Registration(Fridge("fridge-a", 5021)), create: true), "Duplicate device was created.");
         var version = store.Snapshot().Version;
-        Check(store.Save(Fridge("fridge-a", 5021, enabled: false), create: false), "Update failed.");
+        Check(store.Save(Registration(Fridge("fridge-a", 5021, enabled: false)), create: false), "Update failed.");
         var disabled = store.Snapshot();
         Check(disabled.Version > version && disabled.Devices.Length == 0, "Disabling did not bump the version or hide the device.");
         Check(store.Delete("fridge-a") && store.Snapshot().Version > disabled.Version, "Delete did not bump the version.");
@@ -51,7 +57,7 @@ internal static class ModbusChecks
             Fridge("fridge-e", 5021) with { Metrics = [new("X", "holding", 0, 1, ""), new("X", "holding", 1, 1, "")] }
         })
         {
-            try { store.Save(bad, create: true); throw new Exception($"Invalid device {bad.Id} was accepted."); }
+            try { store.Save(Registration(bad), create: true); throw new Exception($"Invalid device {bad.Id} was accepted."); }
             catch (ArgumentException) { }
         }
     }

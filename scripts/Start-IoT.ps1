@@ -34,7 +34,7 @@ try {
         Start-Sleep -Milliseconds 300
     }
     Write-Output 'Edge running: configuration http://127.0.0.1:5300, gateway -> Mosquitto :8883. Logs: logs/'
-    Write-Output 'Register devices with POST http://127.0.0.1:5300/devices (or the demo console), e.g. ModSim on port 502.'
+    Write-Output 'Create an interface with POST http://127.0.0.1:5300/interfaces, then register devices with POST /devices (or use the demo console).'
     Write-Output 'The gateway runs below (no backend: an empty HostId, so it publishes without waiting for one). Press Ctrl+C to stop everything.'
     dotnet (Join-Path $workspace 'src/EdgeGateway/EdgeGateway.Gateway/bin/Debug/net8.0/EdgeGateway.Gateway.dll') '--Sparkplug:HostId=' |
         Tee-Object -FilePath (Join-Path $logDirectory 'EdgeGateway.Gateway.log')

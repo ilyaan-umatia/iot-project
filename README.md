@@ -13,7 +13,7 @@ Modbus devices ◄── Modbus TCP polling ── EdgeGateway.Gateway [poll →
 ```
 
 - **Devices:** any Modbus TCP server, such as ModSim or a PLC. Nothing is built in: a device exists only once it is registered in the configuration service, and its values change on the device itself.
-- **Configuration service:** stores each device's address, unit ID, poll interval, GPIO pin and register map. `GET/POST/PUT/DELETE /devices`, `GET /config`. It holds configuration only; online/offline comes from the gateway. It starts empty.
+- **Configuration service:** stores shared connection settings in `Interfaces` (`Id`, `Type`, JSON `Settings`). `Devices` references `InterfaceId` and keeps unit ID, polling interval, enabled status and metrics in JSON `Data`. `GET/POST/PUT/DELETE /interfaces` and `/devices`; `GET /config` resolves complete TCP polling definitions for the gateway/cache. It holds configuration only; online/offline comes from the gateway. It starts empty.
 - **Gateway (one process):** one poll loop per enabled device. Each reading is numbered (persisted per device) and saved to the SQLite outbox before publishing. Committed readings survive a gateway crash or a broker outage. The publishing loop drains the outbox in order as Sparkplug B (NBIRTH/DBIRTH/DDATA/DDEATH, Rebirth, historical replay) and marks a row sent only after the broker's acknowledgement.
   - After 3 failed polls a device is reported offline (DDEATH); the next good poll brings it back (DBIRTH).
   - Devices added, changed or removed in the registry apply within about 10 seconds; a changed metric list triggers a new DBIRTH.
@@ -36,10 +36,11 @@ The gateway groups each device's metrics into **frames**: one read request per r
 
 Addresses are 0-based. Tools such as ModSim number holding registers from 40001, so register 40001 is address 0 and 40100 is address 99.
 
-Example: registering a ModSim device on port 502 with a temperature in its first holding register:
+Example: first create a shared TCP interface, then register a ModSim device with a temperature in its first holding register:
 
 ```bash
-curl -X POST http://127.0.0.1:5300/devices -H "Content-Type: application/json" -d '{"id":"modsim-01","enabled":true,"protocol":"ModbusTcp","host":"127.0.0.1","port":502,"unitId":1,"pollIntervalSeconds":3,"description":"ModSim","metrics":[{"name":"Temperature","register":"holding","address":0,"dataType":"int16","scale":0.1,"unit":"°C"}]}'
+curl -X POST http://127.0.0.1:5300/interfaces -H "Content-Type: application/json" -d '{"id":"modsim-local","type":"ModbusTcp","settings":{"host":"127.0.0.1","port":502}}'
+curl -X POST http://127.0.0.1:5300/devices -H "Content-Type: application/json" -d '{"id":"modsim-01","interfaceId":"modsim-local","enabled":true,"unitId":1,"pollIntervalSeconds":3,"description":"ModSim","metrics":[{"name":"Temperature","register":"holding","address":0,"dataType":"int16","scale":0.1,"unit":"°C"}]}'
 ```
 
 ## Configuration
@@ -55,6 +56,12 @@ Root `appsettings.json` (ignored by Git) holds shared settings; the settings cla
 
 The backend (`Application.Api`) is not part of this flow; MQTTX and the demo console are the consumers. A non-empty `HostId` would make the gateway wait for a Sparkplug Primary Host's STATE, so both launchers start the gateway with an empty one.
 
+Multiple devices can reference the same interface with their own Unit IDs and metric maps. Updating an interface bumps the configuration version and reloads affected pollers. A referenced interface cannot be deleted; reassign or remove its devices first. Removing a device keeps its interface available for reuse. TCP connection/read/write timeouts remain fixed at 2000 ms.
+
+`ModbusRtu` interfaces accept JSON settings such as `{"portName":"COM3","baudRate":19200,"dataBits":8,"parity":"Even","stopBits":1}`. This is **configuration-only**: serial devices must have `enabled:false`; no serial port is opened and no RTU polling runs.
+
+This schema starts with a fresh Configuration DB; old device-registration bodies are not supported. On the initial switch, stop the applications and remove only the old Configuration DB and gateway `config-cache.json`. For the demo these are `logs/demo/state/configuration.db` (including any `-wal`/`-shm` sidecars after stopping) and `logs/demo/state/daq/config-cache.json`. Keep `outbox.db`, sequence files and node state. The configuration service reports an explicit error if pointed at the old schema. Do not use **Reset demo** for this transition: it also removes the outbox and broker state.
+
 ## Demo console (recommended)
 
 ```powershell
@@ -67,6 +74,9 @@ This opens `http://127.0.0.1:5200` (loopback only, because it starts and kills p
 - **Data path:** one box per registered device with its live polling state, plus Start, Stop and Crash for the configuration service and gateway, and Start, Stop, Restart and Crash for the broker.
 - **Devices being polled:** each device's state (polling, failing, offline), endpoint, last reading and last error.
 - **Device registry tab:** add, edit, enable, disable or remove devices with a form covering every field, and see what the gateway is doing with each one: state, read frames, raw register values and the last error.
+- **Interfaces tab:** create/edit shared TCP or configuration-only RTU settings, see the number of referencing devices, and remove unused interfaces. Add Device can select an existing interface or create one inline. A new interface and device commit together; validation/conflict errors leave neither new record saved. Device editing selects an existing interface.
+
+For an API client, `POST /devices/with-interface` accepts `{ "device": { ... }, "newInterface": { ... } }`, using the same device and interface fields as the separate endpoints. `device.interfaceId` must match `newInterface.id`. Both IDs must be new; the configuration version increments once.
 - **Activity tab:** every change in one timeline: registry edits, configuration loads, devices online, failing or offline, births and deaths, broker connection and replay, component actions.
 - **Resilience test:** crashes Mosquitto, the gateway and the configuration service, then checks every reading the gateway polled arrived on Mosquitto exactly once.
 - **Device cards, chart and missing/duplicate counts:** rebuilt from the Sparkplug messages on Mosquitto, using each reading's DeviceSeq.

@@ -24,13 +24,29 @@ app.MapGet("/health", () => "ok");
 app.MapGet("/config", () => store.Snapshot());
 app.MapGet("/devices", () => store.All());
 app.MapGet("/devices/{id}", (string id) => store.Find(id) is { } device ? Results.Ok(device) : Results.NotFound());
-app.MapPost("/devices", (DeviceDefinition device) => Write(() => store.Save(device, create: true)
+app.MapPost("/devices", (DeviceRegistration device) => Write(() => store.Save(device, create: true)
     ? Results.Created($"/devices/{device.Id}", device)
     : Results.Conflict(new { message = $"Device {device.Id} already exists." })));
-app.MapPut("/devices/{id}", (string id, DeviceDefinition device) => Write(() => device.Id != id
+app.MapPost("/devices/with-interface", (DeviceWithInterface request) => Write(() =>
+    request.Device is null || request.NewInterface is null
+        ? Results.BadRequest(new { message = "device and newInterface are required." })
+        : store.Save(request.Device, create: true, request.NewInterface)
+            ? Results.Created($"/devices/{request.Device.Id}", request.Device)
+            : Results.Conflict(new { message = $"Device {request.Device.Id} already exists." })));
+app.MapPut("/devices/{id}", (string id, DeviceRegistration device) => Write(() => device.Id != id
     ? Results.BadRequest(new { message = "The device ID in the body must match the URL." })
     : store.Save(device, create: false) ? Results.Ok(device) : Results.NotFound()));
 app.MapDelete("/devices/{id}", (string id) => store.Delete(id) ? Results.NoContent() : Results.NotFound());
+
+app.MapGet("/interfaces", () => store.AllInterfaces());
+app.MapGet("/interfaces/{id}", (string id) => store.FindInterface(id) is { } connection ? Results.Ok(connection) : Results.NotFound());
+app.MapPost("/interfaces", (ModbusInterface connection) => Write(() => store.SaveInterface(connection, create: true)
+    ? Results.Created($"/interfaces/{connection.Id}", connection)
+    : Results.Conflict(new { message = $"Interface {connection.Id} already exists." })));
+app.MapPut("/interfaces/{id}", (string id, ModbusInterface connection) => Write(() => connection.Id != id
+    ? Results.BadRequest(new { message = "The interface ID in the body must match the URL." })
+    : store.SaveInterface(connection, create: false) ? Results.Ok(connection) : Results.NotFound()));
+app.MapDelete("/interfaces/{id}", (string id) => Write(() => store.DeleteInterface(id) ? Results.NoContent() : Results.NotFound()));
 
 Console.WriteLine($"Configuration service: {builder.Configuration["Configuration:Url"] ?? "http://127.0.0.1:5300"} ({store.All().Length} devices).");
 app.Run();
@@ -38,6 +54,7 @@ app.Run();
 static IResult Write(Func<IResult> action)
 {
     try { return action(); }
+    catch (ConfigurationConflictException error) { return Results.Conflict(new { message = error.Message }); }
     catch (ArgumentException error) { return Results.BadRequest(new { message = error.Message }); }
 }
 

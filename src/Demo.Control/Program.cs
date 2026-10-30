@@ -52,19 +52,21 @@ app.MapGet("/api/config/devices", (IHttpClientFactory factory) =>
     Forward(factory, HttpMethod.Get, "/devices"));
 app.MapPost("/api/config/devices", async (HttpContext context, IHttpClientFactory factory) =>
     await Forward(factory, HttpMethod.Post, "/devices", await new StreamReader(context.Request.Body).ReadToEndAsync(), "Device added to the registry"));
+app.MapPost("/api/config/devices/with-interface", async (HttpContext context, IHttpClientFactory factory) =>
+    await Forward(factory, HttpMethod.Post, "/devices/with-interface", await new StreamReader(context.Request.Body).ReadToEndAsync(), "Device and interface added to the registry"));
 app.MapPost("/api/config/devices/{id}/enabled/{enabled:bool}", async (string id, bool enabled, IHttpClientFactory factory) =>
 {
     try
     {
         var client = factory.CreateClient("configuration");
-        var device = await client.GetFromJsonAsync<IoT.Contracts.DeviceDefinition>($"{components.ConfigurationUrl}/devices/{id}",
+        var device = await client.GetFromJsonAsync<IoT.Contracts.DeviceRegistration>($"{components.ConfigurationUrl}/devices/{Uri.EscapeDataString(id)}",
             IoT.Contracts.EdgeTopics.Json);
         if (device is null) return Results.NotFound();
         var response = await client.PutAsJsonAsync($"{components.ConfigurationUrl}/devices/{id}", device with { Enabled = enabled },
             IoT.Contracts.EdgeTopics.Json);
         return response.IsSuccessStatusCode
             ? Recorded(components.Activity, $"{id} {(enabled ? "enabled" : "disabled")} in the device registry.")
-            : Results.StatusCode((int)response.StatusCode);
+            : Results.Content(await response.Content.ReadAsStringAsync(), "application/json", statusCode: (int)response.StatusCode);
     }
     catch (Exception error) when (error is HttpRequestException or TaskCanceledException)
     {
@@ -75,7 +77,16 @@ app.MapPut("/api/config/devices/{id}", async (string id, HttpContext context, IH
     await Forward(factory, HttpMethod.Put, $"/devices/{Uri.EscapeDataString(id)}",
         await new StreamReader(context.Request.Body).ReadToEndAsync(), $"{id}: registry entry updated"));
 app.MapDelete("/api/config/devices/{id}", (string id, IHttpClientFactory factory) =>
-    Forward(factory, HttpMethod.Delete, $"/devices/{id}", null, $"{id}: removed from the registry"));
+    Forward(factory, HttpMethod.Delete, $"/devices/{Uri.EscapeDataString(id)}", null, $"{id}: removed from the registry"));
+
+app.MapGet("/api/config/interfaces", (IHttpClientFactory factory) => Forward(factory, HttpMethod.Get, "/interfaces"));
+app.MapPost("/api/config/interfaces", async (HttpContext context, IHttpClientFactory factory) =>
+    await Forward(factory, HttpMethod.Post, "/interfaces", await new StreamReader(context.Request.Body).ReadToEndAsync(), "Interface added"));
+app.MapPut("/api/config/interfaces/{id}", async (string id, HttpContext context, IHttpClientFactory factory) =>
+    await Forward(factory, HttpMethod.Put, $"/interfaces/{Uri.EscapeDataString(id)}",
+        await new StreamReader(context.Request.Body).ReadToEndAsync(), $"{id}: shared interface updated"));
+app.MapDelete("/api/config/interfaces/{id}", (string id, IHttpClientFactory factory) =>
+    Forward(factory, HttpMethod.Delete, $"/interfaces/{Uri.EscapeDataString(id)}", null, $"{id}: interface removed"));
 
 async Task<IResult> Forward(IHttpClientFactory factory, HttpMethod method, string path, string? body = null, string? activity = null)
 {

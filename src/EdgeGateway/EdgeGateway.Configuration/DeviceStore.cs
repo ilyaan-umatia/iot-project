@@ -4,7 +4,7 @@ using Microsoft.Data.Sqlite;
 
 namespace EdgeGateway.Configuration;
 
-// Device metadata in SQLite. Every change bumps the version so data acquisition knows to reload.
+// One owner/connection for the registry. Every successful write and its version bump commit together.
 public sealed class DeviceStore : IDisposable
 {
     private readonly SqliteConnection _connection;
@@ -17,60 +17,177 @@ public sealed class DeviceStore : IDisposable
             databasePath = Path.GetFullPath(databasePath);
             Directory.CreateDirectory(Path.GetDirectoryName(databasePath)!);
         }
-        _connection = new(new SqliteConnectionStringBuilder { DataSource = databasePath, Pooling = false }.ToString());
-        _connection.Open();
-        Execute("""
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS Devices (Id TEXT PRIMARY KEY, Data TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS Meta (Key TEXT PRIMARY KEY, Value INTEGER NOT NULL);
-            INSERT OR IGNORE INTO Meta (Key, Value) VALUES ('Version', 0);
-            """);
+        _connection = new(new SqliteConnectionStringBuilder { DataSource = databasePath, Pooling = false, ForeignKeys = true }.ToString());
+        try
+        {
+            _connection.Open();
+            using (var command = Command("PRAGMA table_info(Devices)"))
+            using (var reader = command.ExecuteReader())
+            {
+                var columns = new List<string>();
+                while (reader.Read()) columns.Add(reader.GetString(1));
+                if (columns.Count > 0 && !columns.Contains("InterfaceId"))
+                    throw new InvalidOperationException("Old Configuration DB schema. Stop the configuration service and remove only its configuration.db (and old gateway config-cache.json), then restart. Do not remove the gateway outbox or node state.");
+            }
+            Execute("""
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE IF NOT EXISTS Interfaces (
+                    Id TEXT NOT NULL PRIMARY KEY, Type TEXT NOT NULL, Settings TEXT NOT NULL CHECK(json_valid(Settings)));
+                CREATE TABLE IF NOT EXISTS Devices (
+                    Id TEXT NOT NULL PRIMARY KEY,
+                    InterfaceId TEXT NOT NULL REFERENCES Interfaces(Id) ON DELETE RESTRICT,
+                    Data TEXT NOT NULL CHECK(json_valid(Data)));
+                CREATE INDEX IF NOT EXISTS IX_Devices_InterfaceId ON Devices(InterfaceId);
+                CREATE TABLE IF NOT EXISTS Meta (Key TEXT PRIMARY KEY, Value INTEGER NOT NULL);
+                INSERT OR IGNORE INTO Meta (Key, Value) VALUES ('Version', 0);
+                """);
+        }
+        catch { _connection.Dispose(); throw; }
     }
 
-    public DeviceDefinition[] All()
+    public DeviceRegistration[] All()
     {
         lock (_gate)
         {
-            using var command = Command("SELECT Data FROM Devices ORDER BY Id");
+            using var command = Command("SELECT Id, InterfaceId, Data FROM Devices ORDER BY Id");
             using var reader = command.ExecuteReader();
-            var devices = new List<DeviceDefinition>();
-            while (reader.Read()) devices.Add(JsonSerializer.Deserialize<DeviceDefinition>(reader.GetString(0), EdgeTopics.Json)!);
+            var devices = new List<DeviceRegistration>();
+            while (reader.Read()) devices.Add(ReadDevice(reader));
             return devices.ToArray();
         }
     }
 
-    public DeviceDefinition? Find(string id) => All().FirstOrDefault(device => device.Id == id);
+    public DeviceRegistration? Find(string id)
+    {
+        lock (_gate)
+        {
+            using var command = Command("SELECT Id, InterfaceId, Data FROM Devices WHERE Id = $id", null, ("$id", id));
+            using var reader = command.ExecuteReader();
+            return reader.Read() ? ReadDevice(reader) : null;
+        }
+    }
 
+    public ModbusInterface[] AllInterfaces()
+    {
+        lock (_gate)
+        {
+            using var command = Command("SELECT Id, Type, Settings FROM Interfaces ORDER BY Id");
+            using var reader = command.ExecuteReader();
+            var interfaces = new List<ModbusInterface>();
+            while (reader.Read()) interfaces.Add(ReadInterface(reader));
+            return interfaces.ToArray();
+        }
+    }
+
+    public ModbusInterface? FindInterface(string id)
+    {
+        lock (_gate) return FindInterface(id, null);
+    }
+
+    // Resolve in one read transaction: cacheable polling definitions cannot mix old/new interface settings.
     public GatewayConfiguration Snapshot()
     {
         lock (_gate)
-            return new((long)Scalar("SELECT Value FROM Meta WHERE Key = 'Version'")!,
-                All().Where(device => device.Enabled).ToArray());
+        {
+            using var transaction = _connection.BeginTransaction(deferred: true);
+            var version = (long)Scalar("SELECT Value FROM Meta WHERE Key = 'Version'", transaction)!;
+            using var command = Command("""
+                SELECT d.Id, d.InterfaceId, d.Data, i.Type, i.Settings
+                FROM Devices d JOIN Interfaces i ON i.Id = d.InterfaceId ORDER BY d.Id
+                """, transaction);
+            var devices = new List<DeviceDefinition>();
+            using (var reader = command.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    var device = ReadDevice(reader);
+                    if (!device.Enabled) continue;
+                    var connection = new ModbusInterface(device.InterfaceId, reader.GetString(3),
+                        JsonSerializer.Deserialize<JsonElement>(reader.GetString(4)));
+                    ValidateConnection(device, connection);
+                    var tcp = connection.TcpSettings();
+                    devices.Add(new(device.Id, device.Enabled, connection.Type, tcp.Host, tcp.Port, device.UnitId,
+                        device.PollIntervalSeconds, device.GpioPin, device.Description, device.Metrics, device.InterfaceId));
+                }
+            }
+            transaction.Commit();
+            return new(version, devices.ToArray());
+        }
     }
 
-    // Returns false when creating a device whose ID already exists, or updating one that does not.
-    public bool Save(DeviceDefinition device, bool create)
+    public bool Save(DeviceRegistration device, bool create, ModbusInterface? newInterface = null)
     {
         device.Validate();
+        if (newInterface is not null)
+        {
+            if (!create) throw new ArgumentException("A new interface can only be created with a new device.");
+            newInterface.Validate();
+            if (device.InterfaceId != newInterface.Id) throw new ArgumentException("Device interfaceId must match the new interface ID.");
+        }
         lock (_gate)
         {
             using var transaction = _connection.BeginTransaction();
             var exists = Scalar("SELECT 1 FROM Devices WHERE Id = $id", transaction, ("$id", device.Id)) is not null;
             if (exists == create) return false;
-            Execute("INSERT INTO Devices (Id, Data) VALUES ($id, $data) ON CONFLICT(Id) DO UPDATE SET Data = excluded.Data",
-                transaction, ("$id", device.Id), ("$data", JsonSerializer.Serialize(device, EdgeTopics.Json)));
+            var connection = newInterface ?? FindInterface(device.InterfaceId, transaction)
+                ?? throw new ArgumentException($"Interface {device.InterfaceId} does not exist.");
+            ValidateConnection(device, connection);
+            if (newInterface is not null)
+            {
+                if (FindInterface(newInterface.Id, transaction) is not null)
+                    throw new ConfigurationConflictException($"Interface {newInterface.Id} already exists. Select the existing interface instead.");
+                Execute("INSERT INTO Interfaces (Id, Type, Settings) VALUES ($id, $type, $settings)", transaction,
+                    ("$id", newInterface.Id), ("$type", newInterface.Type), ("$settings", newInterface.Settings.GetRawText()));
+            }
+            var data = new DeviceData(device.Enabled, device.UnitId, device.PollIntervalSeconds, device.GpioPin, device.Description, device.Metrics);
+            Execute("""
+                INSERT INTO Devices (Id, InterfaceId, Data) VALUES ($id, $interface, $data)
+                ON CONFLICT(Id) DO UPDATE SET InterfaceId = excluded.InterfaceId, Data = excluded.Data
+                """, transaction, ("$id", device.Id), ("$interface", device.InterfaceId), ("$data", JsonSerializer.Serialize(data, EdgeTopics.Json)));
             BumpVersion(transaction);
             transaction.Commit();
             return true;
         }
     }
 
-    public bool Delete(string id)
+    public bool SaveInterface(ModbusInterface connection, bool create)
+    {
+        connection.Validate();
+        lock (_gate)
+        {
+            using var transaction = _connection.BeginTransaction();
+            var exists = FindInterface(connection.Id, transaction) is not null;
+            if (exists == create) return false;
+            using (var command = Command("SELECT Id, InterfaceId, Data FROM Devices WHERE InterfaceId = $id", transaction, ("$id", connection.Id)))
+            using (var reader = command.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    try { ValidateConnection(ReadDevice(reader), connection); }
+                    catch (ArgumentException error) { throw new ConfigurationConflictException($"Interface update rejected: {error.Message}"); }
+                }
+            }
+            Execute("""
+                INSERT INTO Interfaces (Id, Type, Settings) VALUES ($id, $type, $settings)
+                ON CONFLICT(Id) DO UPDATE SET Type = excluded.Type, Settings = excluded.Settings
+                """, transaction, ("$id", connection.Id), ("$type", connection.Type), ("$settings", connection.Settings.GetRawText()));
+            BumpVersion(transaction);
+            transaction.Commit();
+            return true;
+        }
+    }
+
+    public bool Delete(string id) => DeleteRecord("Devices", id);
+    public bool DeleteInterface(string id) => DeleteRecord("Interfaces", id);
+
+    private bool DeleteRecord(string table, string id)
     {
         lock (_gate)
         {
             using var transaction = _connection.BeginTransaction();
-            using var command = Command("DELETE FROM Devices WHERE Id = $id", transaction, ("$id", id));
+            if (table == "Interfaces" && Scalar("SELECT 1 FROM Devices WHERE InterfaceId = $id LIMIT 1", transaction, ("$id", id)) is not null)
+                throw new ConfigurationConflictException($"Interface {id} is used by registered devices. Reassign or remove those devices first.");
+            using var command = Command($"DELETE FROM {table} WHERE Id = $id", transaction, ("$id", id));
             if (command.ExecuteNonQuery() == 0) return false;
             BumpVersion(transaction);
             transaction.Commit();
@@ -78,8 +195,33 @@ public sealed class DeviceStore : IDisposable
         }
     }
 
-    private void BumpVersion(SqliteTransaction transaction) =>
-        Execute("UPDATE Meta SET Value = Value + 1 WHERE Key = 'Version'", transaction);
+    private static void ValidateConnection(DeviceRegistration device, ModbusInterface connection)
+    {
+        connection.Validate();
+        if (connection.Type != ModbusInterface.Rtu) return;
+        if (device.UnitId is < 1 or > 247) throw new ArgumentException($"Device {device.Id}: Modbus RTU Unit ID must be 1–247.");
+        if (device.Enabled) throw new ArgumentException($"Device {device.Id}: Modbus RTU polling is not implemented yet. Save serial devices with enabled=false.");
+    }
+
+    private ModbusInterface? FindInterface(string id, SqliteTransaction? transaction)
+    {
+        using var command = Command("SELECT Id, Type, Settings FROM Interfaces WHERE Id = $id", transaction, ("$id", id));
+        using var reader = command.ExecuteReader();
+        return reader.Read() ? ReadInterface(reader) : null;
+    }
+
+    private sealed record DeviceData(bool Enabled, byte UnitId, int PollIntervalSeconds, int? GpioPin, string Description, MetricDefinition[] Metrics);
+
+    private static DeviceRegistration ReadDevice(SqliteDataReader reader)
+    {
+        var data = JsonSerializer.Deserialize<DeviceData>(reader.GetString(2), EdgeTopics.Json)!;
+        return new(reader.GetString(0), reader.GetString(1), data.Enabled, data.UnitId, data.PollIntervalSeconds, data.GpioPin, data.Description, data.Metrics);
+    }
+
+    private static ModbusInterface ReadInterface(SqliteDataReader reader) =>
+        new(reader.GetString(0), reader.GetString(1), JsonSerializer.Deserialize<JsonElement>(reader.GetString(2)));
+
+    private void BumpVersion(SqliteTransaction transaction) => Execute("UPDATE Meta SET Value = Value + 1 WHERE Key = 'Version'", transaction);
 
     private void Execute(string sql, SqliteTransaction? transaction = null, params (string Name, object? Value)[] values)
     {
@@ -104,3 +246,5 @@ public sealed class DeviceStore : IDisposable
 
     public void Dispose() => _connection.Dispose();
 }
+
+public sealed class ConfigurationConflictException(string message) : Exception(message);

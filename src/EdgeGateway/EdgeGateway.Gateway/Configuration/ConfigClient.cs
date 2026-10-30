@@ -18,12 +18,13 @@ public sealed class ConfigClient(DaqSettings settings) : IDisposable
             var configuration = await _http.GetFromJsonAsync<GatewayConfiguration>(
                 settings.ConfigUrl.TrimEnd('/') + "/config", EdgeTopics.Json, cancellationToken);
             if (configuration is null) return null;
+            configuration.Validate(); // Do not replace a usable cache with an invalid/old-format snapshot.
             Directory.CreateDirectory(settings.StateDirectory);
             await File.WriteAllTextAsync(_cachePath + ".tmp", JsonSerializer.Serialize(configuration, EdgeTopics.Json), cancellationToken);
             File.Move(_cachePath + ".tmp", _cachePath, overwrite: true);
             return configuration;
         }
-        catch (Exception error) when (error is HttpRequestException or TaskCanceledException or JsonException
+        catch (Exception error) when (error is HttpRequestException or TaskCanceledException or JsonException or ArgumentException
                                           && !cancellationToken.IsCancellationRequested)
         {
             return null;
@@ -32,8 +33,13 @@ public sealed class ConfigClient(DaqSettings settings) : IDisposable
 
     public GatewayConfiguration? LoadCache()
     {
-        try { return JsonSerializer.Deserialize<GatewayConfiguration>(File.ReadAllText(_cachePath), EdgeTopics.Json); }
-        catch (Exception error) when (error is IOException or JsonException) { return null; }
+        try
+        {
+            var configuration = JsonSerializer.Deserialize<GatewayConfiguration>(File.ReadAllText(_cachePath), EdgeTopics.Json);
+            configuration?.Validate();
+            return configuration;
+        }
+        catch (Exception error) when (error is IOException or JsonException or ArgumentException) { return null; }
     }
 
     public void Dispose() => _http.Dispose();

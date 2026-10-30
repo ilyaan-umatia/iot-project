@@ -283,6 +283,7 @@
       <div class="tabs" id="tabs">
         <button class="tab on" data-tab="upstream">On the wire: Mosquitto</button>
         <button class="tab" data-tab="registry">Device registry</button>
+        <button class="tab" data-tab="interfaces">Interfaces</button>
         <button class="tab" data-tab="activity">Activity</button>
         <button class="tab" data-tab="logs">Logs</button>
       </div>
@@ -306,6 +307,7 @@ const CORE = {
 const TAB_NOTES = {
   upstream: "Every Sparkplug message passing through Mosquitto, decoded live, including STATE and NCMD.",
   registry: "Devices in the configuration service. Data acquisition polls every enabled device; changes apply within about 10 seconds.",
+  interfaces: "Shared connection settings. TCP polling is supported; Modbus RTU is configuration-only and does not open a serial port.",
   activity: "Everything that changed, newest first: registry edits, configuration loads, devices online, failing or offline, births and deaths, broker connection and replay, component actions and door/fault commands. Readings are on the wire tab.",
   logs: "Console output of the selected component."
 };
@@ -565,6 +567,7 @@ function renderChart(histories) {
 
 // Feed
 async function renderFeed() {
+  const requestedTab = tab;
   const names = ["gateway", "configuration"];
   $("tabnote").innerHTML = esc(TAB_NOTES[tab]) + (tab === "logs"
     ? ` <select id="log-name">${names.map(n => `<option${n === logName ? " selected" : ""}>${n}</option>`).join("")}</select>` : "");
@@ -572,6 +575,7 @@ async function renderFeed() {
   try {
     if (tab === "logs") {
       const lines = await getJson("/api/logs/" + logName);
+      if (tab !== requestedTab || formOpen) return;
       const atBottom = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 20;
       feed.innerHTML = `<pre class="logs">${esc(lines.join("\n")) || "No output yet."}</pre>`;
       if (atBottom) feed.scrollTop = feed.scrollHeight;
@@ -579,6 +583,7 @@ async function renderFeed() {
     }
     if (tab === "activity") {
       const entries = await getJson("/api/activity");
+      if (tab !== requestedTab || formOpen) return;
       feed.innerHTML = entries.length ? entries.map(a => `
         <div class="row" style="grid-template-columns: 62px 74px minmax(0, 1fr)">
           <time>${esc(time(a.at))}</time>
@@ -589,23 +594,45 @@ async function renderFeed() {
     }
     if (tab === "registry") {
       if (formOpen) return; // keep what is being typed in the device form
-      const devices = registryDevices = await getJson("/api/config/devices");
+      const [devices, interfaces] = await Promise.all([getJson("/api/config/devices"), getJson("/api/config/interfaces")]);
+      if (tab !== requestedTab || formOpen) return;
+      registryDevices = devices;
+      registryInterfaces = interfaces;
       const cfg = state.gateway?.config;
       feed.innerHTML = `<div style="margin-bottom:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn sm primary" data-registry="add">Add device</button>
           <span class="sub" style="font-size:12px">${state.gateway ? `Gateway has configuration v${esc(cfg?.version ?? "—")}${cfg && !cfg.reachable ? " · registry unreachable, using cached copy" : ""}` : "Gateway not running: no live status"}</span></div>` +
         (devices.length ? devices.map(d => `
         <div class="row" style="grid-template-columns: minmax(0,1fr) auto">
-          <span class="text wrap"><b>${esc(d.id)}</b> · ${esc(d.host)}:${esc(d.port)} unit ${esc(d.unitId)} · every ${esc(d.pollIntervalSeconds)}s${d.gpioPin != null ? ` · GPIO ${esc(d.gpioPin)}` : ""}
+          <span class="text wrap"><b>${esc(d.id)}</b> · ${esc(d.interfaceId)} · ${esc(interfaceEndpoint(registryInterfaces.find(i => i.id === d.interfaceId)))} unit ${esc(d.unitId)} · every ${esc(d.pollIntervalSeconds)}s${d.gpioPin != null ? ` · GPIO ${esc(d.gpioPin)}` : ""}
             ${d.enabled ? '<span class="tag ok">enabled</span>' : '<span class="tag">disabled</span>'}<br>
             <span class="sub" style="font-size:12px">${d.metrics.map(m => `${esc(m.name)}: ${esc(m.register)} ${esc(m.address)} ${esc(m.dataType ?? (["coil", "discrete"].includes(m.register) ? "bool" : "int16"))} ×${esc(m.scale)} ${esc(m.unit)}`).join(" · ")}</span>
             ${pollStatus(d)}</span>
           <span style="display:flex;gap:4px"><button class="btn sm" data-registry="edit/${esc(d.id)}">Edit</button>
-            <button class="btn sm" data-registry="${d.enabled ? "disable" : "enable"}/${esc(d.id)}">${d.enabled ? "Disable" : "Enable"}</button>
+            <button class="btn sm" data-registry="${d.enabled ? "disable" : "enable"}/${esc(d.id)}"${!d.enabled && registryInterfaces.find(i => i.id === d.interfaceId)?.type === "ModbusRtu" ? ' disabled title="RTU polling is not implemented"' : ""}>${d.enabled ? "Disable" : "Enable"}</button>
             <button class="btn sm danger" data-registry="delete/${esc(d.id)}">Remove</button></span>
         </div>`).join("") : '<div class="empty">No devices registered.</div>');
       return;
     }
+    if (tab === "interfaces") {
+      if (formOpen) return;
+      const [interfaces, devices] = await Promise.all([getJson("/api/config/interfaces"), getJson("/api/config/devices")]);
+      if (tab !== requestedTab || formOpen) return;
+      registryInterfaces = interfaces;
+      registryDevices = devices;
+      feed.innerHTML = '<button class="btn sm primary" data-interface="add">Add interface</button>' +
+        (registryInterfaces.length ? registryInterfaces.map(i => {
+          const count = registryDevices.filter(d => d.interfaceId === i.id).length;
+          return `<div class="row" style="grid-template-columns:minmax(0,1fr) auto">
+            <span class="text wrap"><b>${esc(i.id)}</b> · ${esc(i.type)}<br>${esc(interfaceEndpoint(i))}
+              ${i.type === "ModbusRtu" ? '<span class="tag warn">configuration only</span>' : ""}
+              <div class="hint">${count} registered device(s) use this interface.</div></span>
+            <span><button class="btn sm" data-interface="edit/${esc(i.id)}">Edit</button>
+              <button class="btn sm danger" data-interface="delete/${esc(i.id)}">Remove</button></span></div>`;
+        }).join("") : '<div class="empty">No interfaces configured.</div>');
+      return;
+    }
     const messages = await getJson("/api/wire/" + tab);
+    if (tab !== requestedTab || formOpen) return;
     const previous = lastWireId;
     lastWireId = Math.max(lastWireId, messages[0]?.id ?? 0);
     feed.innerHTML = messages.length ? messages.map(m => {
@@ -617,6 +644,7 @@ async function renderFeed() {
       </div>`;
     }).join("") : '<div class="empty">No messages seen yet.</div>';
   } catch {
+    if (tab !== requestedTab || formOpen) return;
     feed.innerHTML = '<div class="empty">Not available right now.</div>';
   }
 }
@@ -663,7 +691,14 @@ function pollStatus(device) {
 // Device form: every field the configuration API accepts. The API does the validation and its message is shown here.
 const REGISTER_TYPES = ["int16", "uint16", "int32", "uint32", "float32"];
 const isBit = register => register === "coil" || register === "discrete";
-let formOpen = false, formEditing = null, registryDevices = [];
+let formOpen = false, formEditing = null, registryDevices = [], registryInterfaces = [];
+
+function interfaceEndpoint(connection) {
+  if (!connection) return "missing interface";
+  const s = connection.settings;
+  return connection.type === "ModbusTcp" ? `${s.host}:${s.port}` :
+    `${s.portName} · ${s.baudRate} baud · ${s.dataBits} data bits · ${s.parity} parity · ${s.stopBits} stop bit(s)`;
+}
 
 function metricRow(m = {}) {
   const register = m.register ?? "holding";
@@ -685,21 +720,28 @@ function metricRow(m = {}) {
 function openDeviceForm(device) {
   formOpen = true;
   formEditing = device?.id ?? null;
-  const d = device ?? { id: "", enabled: true, host: "127.0.0.1", port: 502, unitId: 1, pollIntervalSeconds: 3, gpioPin: null,
+  const d = device ?? { id: "", enabled: true, interfaceId: (registryInterfaces.find(i => i.type === "ModbusTcp") ?? registryInterfaces[0])?.id ?? "", unitId: 1, pollIntervalSeconds: 3, gpioPin: null,
     description: "", metrics: [{ name: "Temperature", register: "holding", address: 0, dataType: "int16", scale: 0.1, unit: "°C" }] };
   const field = (key, label, input) => `<label><span>${label}</span>${input}</label>`;
   $("feed").innerHTML = `<form class="dform" id="device-form" autocomplete="off" novalidate>
     <h3>${device ? `Edit ${esc(device.id)}` : "Add device"}</h3>
     <div class="fgrid">
       ${field("id", "Device ID", `<input name="id" value="${esc(d.id)}" ${device ? "readonly" : ""} required placeholder="modsim-02">`)}
-      ${field("host", "Host", `<input name="host" value="${esc(d.host)}" required>`)}
-      ${field("port", "Modbus TCP port", `<input name="port" type="number" min="1" max="65535" value="${esc(d.port)}" required>`)}
+      ${field("interfaceId", "Interface", `<select name="interfaceId">${registryInterfaces.map(i => `<option value="${esc(i.id)}"${i.id === d.interfaceId ? " selected" : ""}>${esc(i.id)} · ${esc(i.type)}</option>`).join("")}${device ? "" : '<option value="">Create new interface…</option>'}</select>`)}
       ${field("unitId", "Unit ID", `<input name="unitId" type="number" min="0" max="255" value="${esc(d.unitId)}" required>`)}
       ${field("pollIntervalSeconds", "Poll every (s)", `<input name="pollIntervalSeconds" type="number" min="1" max="3600" value="${esc(d.pollIntervalSeconds)}" required>`)}
       ${field("gpioPin", "GPIO pin (optional)", `<input name="gpioPin" type="number" min="0" value="${esc(d.gpioPin ?? "")}">`)}
       ${field("description", "Description", `<input name="description" value="${esc(d.description ?? "")}">`)}
       <label class="check"><input name="enabled" type="checkbox"${d.enabled ? " checked" : ""}><span>Enabled (polled)</span></label>
     </div>
+    ${device ? "" : `<div id="new-interface" hidden>
+      <h3>New interface</h3>
+      <div class="fgrid"><label><span>Interface ID</span><input name="newInterfaceId" placeholder="modbus-tcp-02"></label>
+        <label><span>Type</span><select name="newInterfaceType" id="new-interface-type"><option>ModbusTcp</option><option>ModbusRtu</option></select></label></div>
+      <div class="fgrid" id="new-interface-settings">${interfaceSettingsFields("ModbusTcp")}</div>
+      <div class="hint">The new interface and device are saved together.</div>
+    </div>`}
+    <div class="hint" id="device-interface-hint"></div>
     <div class="mhead"><span>Metric</span><span>Area</span><span>Address</span><span>Data type</span><span>Word order</span><span>Scale</span><span>Unit</span><span></span></div>
     <div id="metric-rows">${d.metrics.map(metricRow).join("")}</div>
     <div class="factions">
@@ -710,6 +752,22 @@ function openDeviceForm(device) {
     <div class="factions"><button class="btn primary" data-form="save">${device ? "Save changes" : "Add device"}</button>
       <button class="btn" data-form="cancel">Cancel</button></div>
   </form>`;
+  syncDeviceInterface();
+}
+
+function syncDeviceInterface() {
+  const form = $("device-form");
+  const connection = registryInterfaces.find(i => i.id === form.elements.interfaceId.value);
+  const creating = !formEditing && form.elements.interfaceId.value === "";
+  if ($("new-interface")) $("new-interface").hidden = !creating;
+  const serial = (creating ? form.elements.newInterfaceType.value : connection?.type) === "ModbusRtu";
+  form.elements.enabled.disabled = serial;
+  if (serial) form.elements.enabled.checked = false;
+  form.elements.unitId.min = serial ? "1" : "0";
+  form.elements.unitId.max = serial ? "247" : "255";
+  $("device-interface-hint").textContent = serial
+    ? "Modbus RTU is configuration-only. This device must remain disabled; no serial connection is opened."
+    : creating ? "TCP connection settings will be shared through the new interface." : interfaceEndpoint(connection);
 }
 
 function closeDeviceForm() {
@@ -723,8 +781,8 @@ function readDeviceForm() {
   const value = name => form.elements[name].value.trim();
   const number = name => value(name) === "" ? null : Number(value(name));
   return {
-    id: value("id"), enabled: form.elements.enabled.checked, protocol: "ModbusTcp", host: value("host"),
-    port: number("port"), unitId: number("unitId"), pollIntervalSeconds: number("pollIntervalSeconds"),
+    id: value("id"), enabled: form.elements.enabled.checked, interfaceId: value("interfaceId") || value("newInterfaceId"),
+    unitId: number("unitId"), pollIntervalSeconds: number("pollIntervalSeconds"),
     gpioPin: number("gpioPin"), description: value("description"),
     metrics: [...form.querySelectorAll(".mrow")].map(row => {
       const get = key => row.querySelector(`[data-m="${key}"]`);
@@ -741,8 +799,11 @@ function readDeviceForm() {
 async function saveDeviceForm() {
   const device = readDeviceForm();
   const editing = formEditing;
-  const response = await fetch(editing ? `/api/config/devices/${encodeURIComponent(editing)}` : "/api/config/devices", {
-    method: editing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(device)
+  const form = $("device-form");
+  const newInterface = !editing && form.elements.interfaceId.value === ""
+    ? { id: device.interfaceId, type: form.elements.newInterfaceType.value, settings: readInterfaceSettings(form, form.elements.newInterfaceType.value) } : null;
+  const response = await fetch(editing ? `/api/config/devices/${encodeURIComponent(editing)}` : newInterface ? "/api/config/devices/with-interface" : "/api/config/devices", {
+    method: editing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(newInterface ? { device, newInterface } : device)
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -751,7 +812,73 @@ async function saveDeviceForm() {
     $("form-error").textContent = detail || "Save failed.";
     return;
   }
-  toast(`${device.id} ${editing ? "updated" : "added"}: the gateway applies it within about 10 seconds.`);
+  toast((newInterface ?? registryInterfaces.find(i => i.id === device.interfaceId))?.type === "ModbusRtu"
+    ? `${device.id} saved as configuration only; RTU polling is not implemented.`
+    : `${device.id} ${editing ? "updated" : "added"}: the gateway applies it within about 10 seconds.`);
+  closeDeviceForm();
+}
+
+async function interfaceAction(action) {
+  const [verb, id] = action.split("/");
+  if (verb === "add" || verb === "edit") {
+    openInterfaceForm(verb === "edit" ? registryInterfaces.find(i => i.id === id) : null);
+    return;
+  }
+  if (!confirm(`Remove interface ${id}? Interfaces referenced by devices cannot be removed.`)) return;
+  const response = await fetch(`/api/config/interfaces/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const body = await response.json().catch(() => ({}));
+  toast(response.ok ? `${id} removed.` : body.message || "Remove failed.", !response.ok);
+  renderFeed();
+}
+
+function openInterfaceForm(connection) {
+  formOpen = true;
+  formEditing = connection?.id ?? null;
+  const count = registryDevices.filter(d => d.interfaceId === connection?.id).length;
+  $("feed").innerHTML = `<form class="dform" id="interface-form" autocomplete="off" novalidate>
+    <h3>${connection ? `Edit ${esc(connection.id)}` : "Add interface"}</h3>
+    <div class="fgrid"><label><span>Interface ID</span><input name="id" value="${esc(connection?.id ?? "")}"${connection ? " readonly" : ""} placeholder="modsim-local"></label>
+      <label><span>Type</span><select name="type" id="interface-type"><option>ModbusTcp</option><option${connection?.type === "ModbusRtu" ? " selected" : ""}>ModbusRtu</option></select></label></div>
+    <div class="fgrid" id="interface-settings"></div>
+    <div class="hint">${count} registered device(s) use this interface. TCP setting changes apply on the next configuration refresh. RTU settings are saved only; no serial connection is opened.</div>
+    <div class="ferror" id="form-error" role="alert"></div>
+    <div class="factions"><button class="btn primary" data-form="save-interface">Save interface</button>
+      <button class="btn" data-form="cancel">Cancel</button></div></form>`;
+  renderInterfaceSettings(connection?.settings);
+}
+
+function renderInterfaceSettings(settings = {}) {
+  $("interface-settings").innerHTML = interfaceSettingsFields($("interface-form").elements.type.value, settings);
+}
+
+function interfaceSettingsFields(type, settings = {}) {
+  const serial = type === "ModbusRtu";
+  const field = (name, label, value, type = "text") => `<label><span>${label}</span><input name="${name}" type="${type}" value="${esc(value)}"></label>`;
+  return serial
+    ? field("portName", "Serial port", settings.portName ?? "COM3") + field("baudRate", "Baud rate", settings.baudRate ?? 19200, "number") +
+      field("dataBits", "Data bits (RTU)", settings.dataBits ?? 8, "number") +
+      `<label><span>Parity</span><select name="parity">${["Even", "Odd", "None"].map(p => `<option${p === settings.parity ? " selected" : ""}>${p}</option>`).join("")}</select></label>` +
+      field("stopBits", "Stop bits", settings.stopBits ?? 1, "number")
+    : field("host", "Host", settings.host ?? "127.0.0.1") + field("port", "TCP port", settings.port ?? 502, "number");
+}
+
+function readInterfaceSettings(form, type) {
+  const value = name => form.elements[name].value.trim();
+  const number = name => value(name) === "" ? null : Number(value(name));
+  return type === "ModbusTcp"
+    ? { host: value("host"), port: number("port") }
+    : { portName: value("portName"), baudRate: number("baudRate"), dataBits: number("dataBits"), parity: value("parity"), stopBits: number("stopBits") };
+}
+
+async function saveInterfaceForm() {
+  const form = $("interface-form"), type = form.elements.type.value;
+  const connection = { id: form.elements.id.value.trim(), type, settings: readInterfaceSettings(form, type) };
+  const response = await fetch(formEditing ? `/api/config/interfaces/${encodeURIComponent(formEditing)}` : "/api/config/interfaces", {
+    method: formEditing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(connection)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) { $("form-error").textContent = body.message || response.statusText; return; }
+  toast(`${connection.id} saved.`);
   closeDeviceForm();
 }
 
@@ -764,10 +891,18 @@ document.addEventListener("click", e => {
   else if (kind === "remove-metric") action.closest(".mrow").remove();
   else if (kind === "cancel") closeDeviceForm();
   else if (kind === "save") saveDeviceForm();
+  else if (kind === "save-interface") saveInterfaceForm();
 });
 
 // Keep the data type list valid for the area, and word order only for 32-bit types.
 document.addEventListener("change", e => {
+  if (e.target.id === "interface-type") { renderInterfaceSettings(); return; }
+  if (e.target.id === "new-interface-type") {
+    $("new-interface-settings").innerHTML = interfaceSettingsFields(e.target.value);
+    syncDeviceInterface();
+    return;
+  }
+  if (e.target.name === "interfaceId") { syncDeviceInterface(); return; }
   const row = e.target.closest(".mrow");
   if (!row) return;
   if (e.target.dataset.m === "register") {
@@ -816,6 +951,8 @@ document.addEventListener("click", e => {
   if (act) { const [name, action] = act.dataset.act.split("/"); post(`/api/components/${name}/${action}`, `${CORE[name]?.label ?? name}: ${action}`); return; }
   const registry = e.target.closest("[data-registry]");
   if (registry) { registryAction(registry.dataset.registry); return; }
+  const connection = e.target.closest("[data-interface]");
+  if (connection) { interfaceAction(connection.dataset.interface); return; }
   const demo = e.target.closest("[data-demo]");
   if (demo) {
     if (demo.dataset.demo === "reset" && !confirm("Reset wipes the broker data and demo state, then starts everything fresh. Continue?")) return;

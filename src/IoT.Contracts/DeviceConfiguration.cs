@@ -1,25 +1,46 @@
+using System.Text.Json.Serialization;
+
 namespace IoT.Contracts;
 
-// Shared between the configuration service (which stores it) and data acquisition (which polls by it).
+// Registry contract. Connection settings belong to the referenced interface, not to the device JSON.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record DeviceRegistration(
+    string Id, string InterfaceId, bool Enabled, byte UnitId, int PollIntervalSeconds,
+    int? GpioPin, string Description, MetricDefinition[] Metrics)
+{
+    public void Validate()
+    {
+        ValidateId(Id, "Device ID");
+        ValidateId(InterfaceId, "Interface ID");
+        if (PollIntervalSeconds is < 1 or > 3600) throw new ArgumentException("Poll interval must be 1–3600 seconds.");
+        if (GpioPin is < 0) throw new ArgumentException("GPIO pin must not be negative.");
+        if (Metrics is null || Metrics.Length == 0) throw new ArgumentException("At least one metric is required.");
+        if (Metrics.Any(metric => metric is null)) throw new ArgumentException("Metrics must not contain null entries.");
+        if (Metrics.Select(metric => metric.Name).Distinct(StringComparer.Ordinal).Count() != Metrics.Length)
+            throw new ArgumentException("Metric names must be unique.");
+        foreach (var metric in Metrics) metric.Validate();
+    }
+
+    public static void ValidateId(string id, string label)
+    {
+        if (string.IsNullOrWhiteSpace(id) || id.Any(char.IsWhiteSpace) || id.IndexOfAny(['/', '+', '#']) >= 0)
+            throw new ArgumentException($"{label} must be nonempty and must not contain /, +, # or whitespace.");
+    }
+}
+
+// Resolved TCP polling snapshot: self-contained so the gateway cache never needs an extra interface request.
 public sealed record DeviceDefinition(
     string Id, bool Enabled, string Protocol, string Host, int Port, byte UnitId,
-    int PollIntervalSeconds, int? GpioPin, string Description, MetricDefinition[] Metrics)
+    int PollIntervalSeconds, int? GpioPin, string Description, MetricDefinition[] Metrics, string InterfaceId)
 {
     public const string ModbusTcp = "ModbusTcp";
 
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(Id) || Id.IndexOfAny(['/', '+', '#', ' ']) >= 0)
-            throw new ArgumentException("Device ID must be nonempty and must not contain /, +, # or spaces.");
+        new DeviceRegistration(Id, InterfaceId, Enabled, UnitId, PollIntervalSeconds, GpioPin, Description, Metrics).Validate();
         if (Protocol != ModbusTcp) throw new ArgumentException($"Protocol must be {ModbusTcp}; Modbus RTU comes later.");
         if (string.IsNullOrWhiteSpace(Host)) throw new ArgumentException("Host is required.");
         if (Port is < 1 or > 65535) throw new ArgumentException("Port must be between 1 and 65535.");
-        if (PollIntervalSeconds is < 1 or > 3600) throw new ArgumentException("Poll interval must be 1–3600 seconds.");
-        if (GpioPin is < 0) throw new ArgumentException("GPIO pin must not be negative.");
-        if (Metrics is null || Metrics.Length == 0) throw new ArgumentException("At least one metric is required.");
-        if (Metrics.Select(metric => metric.Name).Distinct(StringComparer.Ordinal).Count() != Metrics.Length)
-            throw new ArgumentException("Metric names must be unique.");
-        foreach (var metric in Metrics) metric.Validate();
     }
 }
 
@@ -56,4 +77,13 @@ public sealed record MetricDefinition(string Name, string Register, ushort Addre
 }
 
 // What data acquisition fetches: every enabled device, with a version that changes on every edit.
-public sealed record GatewayConfiguration(long Version, DeviceDefinition[] Devices);
+public sealed record GatewayConfiguration(long Version, DeviceDefinition[] Devices)
+{
+    public void Validate()
+    {
+        if (Version < 0 || Devices is null) throw new ArgumentException("Invalid configuration snapshot.");
+        if (Devices.Any(device => device is null) || Devices.Select(device => device.Id).Distinct(StringComparer.Ordinal).Count() != Devices.Length)
+            throw new ArgumentException("Snapshot devices must be non-null and have unique IDs.");
+        foreach (var device in Devices) device.Validate();
+    }
+}
